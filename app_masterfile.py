@@ -7,16 +7,22 @@ from difflib import SequenceMatcher
 from textwrap import dedent
 from pathlib import Path
 import tempfile
+import sys  # ⬅️ added
+
 import pandas as pd
 import streamlit as st
 from openpyxl import load_workbook
 
-# Try fast path
+# Try fast path (only works with desktop Excel on Windows)
 try:
     import xlwings as xw  # Windows + Excel only
     XLWINGS_AVAILABLE = True
 except Exception:
     XLWINGS_AVAILABLE = False
+
+# Detect if fast path is actually supported in this runtime
+ON_WINDOWS = sys.platform.startswith("win")
+FAST_SUPPORTED = ON_WINDOWS and XLWINGS_AVAILABLE
 
 # ─────────────────────────────────────────────────────────────────────
 # Page meta + subtle theming (visuals only; core logic unchanged)
@@ -134,13 +140,17 @@ SENTINEL_LIST = object()
 # UI Header
 # ─────────────────────────────────────────────────────────────────────
 st.title("🧾 Masterfile Automation – Amazon")
-st.caption("Fills **only** the Template sheet and preserves all other sheets/styles. Use the Excel-fast writer for big files on Windows.")
+st.caption("Fills **only** the Template sheet and preserves all other sheets/styles. Uses Excel-fast writer on Windows with Excel; otherwise uses an optimized openpyxl path.")
 
-fast_badge = "badge-ok" if XLWINGS_AVAILABLE else "badge-warn"
-fast_text  = "Excel-fast writer available" if XLWINGS_AVAILABLE else "Excel-fast writer unavailable"
-st.markdown(f"<span class='badge {fast_badge}'>{fast_text}</span>  "
-            f"<span class='badge badge-info'>Template-only writer</span>",
-            unsafe_allow_html=True)
+fast_badge = "badge-ok" if FAST_SUPPORTED else "badge-warn"
+fast_text  = "Excel-fast writer available" if FAST_SUPPORTED else "Excel-fast writer unavailable"
+st.markdown(
+    f"<span class='badge {fast_badge}'>{fast_text}</span>  "
+    f"<span class='badge badge-info'>Template-only writer</span>",
+    unsafe_allow_html=True
+)
+if not FAST_SUPPORTED:
+    st.caption("Running on a non-Windows or no-Excel environment. The app will automatically use the openpyxl writer.")
 
 with st.expander("ℹ️ Instructions", expanded=True):
     st.markdown(dedent(f"""
@@ -153,6 +163,8 @@ with st.expander("ℹ️ Instructions", expanded=True):
 
     **Onboarding (.xlsx)**  
     - Row 1 = headers; Row 2+ = data *(best sheet auto-selected)*
+
+    **Mapping JSON** (keys = column names from your onboarding; tool matches by synonyms/case-insensitive).
     """))
 
 # ─────────────────────────────────────────────────────────────────────
@@ -176,8 +188,8 @@ with tab2:
 
 use_fast = st.checkbox(
     "⚡ Use Excel-fast writer (xlwings, Windows + Excel)",
-    value=XLWINGS_AVAILABLE,
-    disabled=not XLWINGS_AVAILABLE,
+    value=FAST_SUPPORTED,            # ⬅️ default depends on runtime
+    disabled=not FAST_SUPPORTED,     # ⬅️ disabled on cloud/without Excel
     help="Writes the whole data block in one shot via Excel. Falls back to openpyxl automatically if anything fails."
 )
 st.markdown("</div>", unsafe_allow_html=True)
@@ -186,83 +198,10 @@ st.divider()
 go = st.button("🚀 Generate Final Masterfile", type="primary")
 
 # ─────────────────────────────────────────────────────────────────────
-# Helpers: build data block & writers (xlwings / openpyxl)
-# ─────────────────────────────────────────────────────────────────────
-def build_block(n_rows, used_cols, master_to_source):
-    """Build a 2-D list of strings for fast block write."""
-    block = [[""] * used_cols for _ in range(n_rows)]
-    for col, src in master_to_source.items():
-        if src is SENTINEL_LIST:
-            for i in range(n_rows):
-                block[i][col-1] = "List"
-        else:
-            vals = src.astype(str).tolist()
-            m = min(len(vals), n_rows)
-            for i in range(m):
-                v = vals[i].strip()
-                if v and v.lower() not in ("nan", "none"):
-                    block[i][col-1] = v
-    return block
-
-def write_with_xlwings_or_raise(master_bytes: bytes, block):
-    """Fast path. Raises on any error so caller can fallback."""
-    with tempfile.TemporaryDirectory() as td:
-        src_path = Path(td) / "master.xlsx"
-        dst_path = Path(td) / "final_masterfile.xlsx"
-        src_path.write_bytes(master_bytes)
-
-        app = xw.App(visible=False, add_book=False)
-        try:
-            app.display_alerts = False
-            app.screen_updating = False
-            wb = app.books.open(str(src_path), update_links=False, read_only=False)
-            excel = app.api
-            # Manual calc for speed; restore after save
-            calc_prev = excel.Calculation
-            excel.Calculation = -4135  # xlCalculationManual
-
-            ws = wb.sheets[MASTER_TEMPLATE_SHEET]
-            ws.range(f"A{MASTER_DATA_START_ROW}").options(expand=False).value = block
-
-            excel.Calculation = calc_prev
-            wb.save(str(dst_path))
-            wb.close()
-        finally:
-            app.quit()
-
-        return dst_path.read_bytes()
-
-def write_with_openpyxl(master_bytes: bytes, master_to_source, n_rows, used_cols):
-    wb = load_workbook(io.BytesIO(master_bytes), read_only=False, data_only=False, keep_links=True)
-    ws = wb[MASTER_TEMPLATE_SHEET]
-
-    col_value_lists = {}
-    for col, src in master_to_source.items():
-        if src is SENTINEL_LIST:
-            continue
-        col_value_lists[col] = src.astype(str).tolist()
-
-    for i in range(n_rows):
-        row_idx = MASTER_DATA_START_ROW + i
-        for col, src in master_to_source.items():
-            if src is SENTINEL_LIST:
-                ws.cell(row=row_idx, column=col, value="List")
-            else:
-                vals = col_value_lists[col]
-                if i < len(vals):
-                    v = vals[i].strip()
-                    if v and v.lower() not in ("nan", "none", ""):
-                        ws.cell(row=row_idx, column=col, value=v)
-
-    bio = io.BytesIO()
-    wb.save(bio)
-    bio.seek(0)
-    return bio.getvalue()
-
-# ─────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────
 if go:
+    # Log area in a “card”
     st.markdown("<div class='section'>", unsafe_allow_html=True)
     st.markdown("### 📝 Log")
     log = st.empty()
@@ -297,7 +236,7 @@ if go:
     masterfile_file.seek(0)
     master_bytes = masterfile_file.read()
 
-    slog("✅ Template headers loaded (working…)")
+    slog("⏳ Reading Template headers…")
     t0 = time.time()
     wb_ro = load_workbook(io.BytesIO(master_bytes), read_only=True, data_only=True, keep_links=True)
     if MASTER_TEMPLATE_SHEET not in wb_ro.sheetnames:
@@ -305,7 +244,9 @@ if go:
         st.markdown("</div>", unsafe_allow_html=True)
         st.stop()
     ws_ro = wb_ro[MASTER_TEMPLATE_SHEET]
-    used_cols = worksheet_used_cols(ws_ro, header_rows=(MASTER_DISPLAY_ROW, MASTER_SECONDARY_ROW), hard_cap=2048, empty_streak_stop=8)
+    # include both rows (2 and 3) so we can read bullet sub-keys
+    used_cols = worksheet_used_cols(ws_ro, header_rows=(MASTER_DISPLAY_ROW, MASTER_SECONDARY_ROW),
+                                    hard_cap=2048, empty_streak_stop=8)
     display_headers   = [ws_ro.cell(row=MASTER_DISPLAY_ROW,   column=c).value or "" for c in range(1, used_cols+1)]
     secondary_headers = [ws_ro.cell(row=MASTER_SECONDARY_ROW, column=c).value or "" for c in range(1, used_cols+1)]
     wb_ro.close()
@@ -372,34 +313,95 @@ if go:
 
     n_rows = len(on_df)
 
-    # Build data block once (used by both writers)
-    block = build_block(n_rows, used_cols, master_to_source)
-
-    # Try FAST path, then fallback automatically
-    out_bytes = None
-    if use_fast and XLWINGS_AVAILABLE:
-        try:
-            slog("⚡ Writing via Excel (xlwings)…")
-            t_write = time.time()
-            out_bytes = write_with_xlwings_or_raise(master_bytes, block)
-            slog(f"✅ Wrote & saved via Excel in {time.time()-t_write:.2f}s")
-        except Exception as e:
-            slog(f"⚠️ Excel fast write failed: `{e}` — switching to openpyxl fallback…")
-
-    if out_bytes is None:
-        slog("🛠️ Writing via openpyxl (fallback)…")
+    # FAST WRITE PATH (xlwings) — only used when FAST_SUPPORTED and user left the toggle on
+    if use_fast and FAST_SUPPORTED:
+        slog("⚡ Using Excel-fast writer (xlwings)…")
         t_write = time.time()
-        out_bytes = write_with_openpyxl(master_bytes, master_to_source, n_rows, used_cols)
+
+        block = [[""] * used_cols for _ in range(n_rows)]
+        for col, src in master_to_source.items():
+            if src is SENTINEL_LIST:
+                for i in range(n_rows):
+                    block[i][col-1] = "List"
+            else:
+                vals = src.astype(str).tolist()
+                m = min(len(vals), n_rows)
+                for i in range(m):
+                    v = vals[i].strip()
+                    if v and v.lower() not in ("nan", "none"):
+                        block[i][col-1] = v
+
+        with tempfile.TemporaryDirectory() as td:
+            src_path = Path(td) / "master.xlsx"
+            dst_path = Path(td) / "final_masterfile.xlsx"
+            src_path.write_bytes(master_bytes)
+
+            app = xw.App(visible=False)
+            try:
+                wb = xw.Book(str(src_path))
+                ws = wb.sheets[MASTER_TEMPLATE_SHEET]
+                start_cell = f"A{MASTER_DATA_START_ROW}"
+                ws.range(start_cell).options(expand=False).value = block
+                wb.save(str(dst_path))
+                wb.close()
+            finally:
+                app.quit()
+
+            out_bytes = (Path(td) / "final_masterfile.xlsx").read_bytes()
+
+        slog(f"✅ Wrote & saved via Excel in {time.time()-t_write:.2f}s")
+        st.download_button(
+            "⬇️ Download Final Masterfile",
+            data=out_bytes,
+            file_name="final_masterfile.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_fast",
+        )
+
+    # Fallback: openpyxl
+    else:
+        slog("🛠️ Writing via openpyxl (optimized fallback)…")
+        t_write = time.time()
+        wb = load_workbook(io.BytesIO(master_bytes), read_only=False, data_only=False, keep_links=True)
+        ws = wb[MASTER_TEMPLATE_SHEET]
+
+        col_value_lists = {}
+        for col, src in master_to_source.items():
+            if src is SENTINEL_LIST:
+                continue
+            col_value_lists[col] = src.astype(str).tolist()
+
+        prog = st.progress(0)
+        total = max(1, n_rows)
+        step = max(1, n_rows // 50)
+
+        for i in range(n_rows):
+            row_idx = MASTER_DATA_START_ROW + i
+            for col, src in master_to_source.items():
+                if src is SENTINEL_LIST:
+                    ws.cell(row=row_idx, column=col, value="List")
+                else:
+                    vals = col_value_lists[col]
+                    if i < len(vals):
+                        v = vals[i].strip()
+                        if v and v.lower() not in ("nan", "none", ""):
+                            ws.cell(row=row_idx, column=col, value=v)
+            if (i + 1) % step == 0:
+                prog.progress((i + 1) / total)
+
+        bio = io.BytesIO()
+        wb.save(bio)
+        bio.seek(0)
+        out_bytes = bio.getvalue()
         slog(f"✅ Wrote & saved via openpyxl in {time.time()-t_write:.2f}s")
 
-    # Download button
-    st.download_button(
-        "⬇️ Download Final Masterfile",
-        data=out_bytes,
-        file_name="final_masterfile.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key="dl_ready",
-    )
+        st.download_button(
+            "⬇️ Download Final Masterfile",
+            data=out_bytes,
+            file_name="final_masterfile.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_fallback",
+        )
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -408,8 +410,8 @@ if go:
 # ─────────────────────────────────────────────────────────────────────
 st.markdown(
     "<div class='section small-note'>"
-    "Tip: If Excel isn’t installed or COM locks up, the app automatically falls back to openpyxl so you still get your file. "
-    "You can toggle the fast path at the top."
+    "Tip: On Streamlit Cloud (Linux), the app automatically uses the openpyxl path. "
+    "Run on Windows with Excel installed to enable the Excel-fast writer."
     "</div>",
     unsafe_allow_html=True
 )
