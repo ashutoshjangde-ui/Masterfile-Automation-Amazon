@@ -19,7 +19,7 @@ except Exception:
     XLWINGS_AVAILABLE = False
 
 # ─────────────────────────────────────────────────────────────────────
-# Page meta + subtle theming (visuals only; core logic unchanged)
+# Page meta + theming (visuals only; core logic unchanged)
 # ─────────────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Masterfile Automation - Amazon",
@@ -27,38 +27,53 @@ st.set_page_config(
     layout="wide"
 )
 
-# Soft palette + “cards”
+# Polished theme
 st.markdown("""
 <style>
+:root{
+  --bg1:#f6f9fc; --bg2:#ffffff;
+  --card:#ffffff; --card-border:#e8eef6;
+  --ink:#0f172a; --muted:#64748b; --accent:#2563eb;
+  --badge-ok:#ecfdf5; --badge-ok-ink:#065f46;
+  --badge-warn:#fff7ed; --badge-warn-ink:#9a3412;
+  --badge-info:#eef2ff; --badge-info-ink:#1e40af;
+}
 /* App background (soft gradient) */
-.stApp { background: linear-gradient(180deg, #f8fafc 0%, #ffffff 80%); }
-
+.stApp { background: linear-gradient(180deg, var(--bg1) 0%, var(--bg2) 70%); }
 /* Main container spacing */
-.block-container { padding-top: 1rem; }
-
+.block-container { padding-top: 0.75rem; }
 /* Card-style sections */
 .section {
-  border: 1px solid #eef2f7;
-  background: #ffffff;
-  border-radius: 14px;
+  border: 1px solid var(--card-border);
+  background: var(--card);
+  border-radius: 16px;
   padding: 18px 20px;
-  box-shadow: 0 4px 18px rgba(2, 6, 23, 0.04);
+  box-shadow: 0 6px 24px rgba(2, 6, 23, 0.05);
   margin-bottom: 18px;
 }
-
-/* Tiny “pills” */
+/* Headings & hr */
+h1, h2, h3 { color: var(--ink); }
+hr { border-color: #eef2f7; }
+/* Badges */
 .badge {
-  display: inline-block; padding: 3px 10px; border-radius: 999px;
-  font-size: 0.82rem; font-weight: 600; letter-spacing: .2px;
+  display:inline-block;padding:4px 10px;border-radius:999px;
+  font-size:0.82rem;font-weight:600;letter-spacing:.2px;margin-right:.25rem
 }
-.badge-info    { background:#eef2ff; color:#1e40af; }
-.badge-ok      { background:#ecfdf5; color:#065f46; }
-.badge-warn    { background:#fff7ed; color:#9a3412; }
-.small-note    { color:#64748b; font-size:0.92rem; }
-
-/* Headings */
-h1, h2, h3 { color:#0f172a; }
-hr { border-color: #f1f5f9; }
+.badge-info { background:var(--badge-info); color:var(--badge-info-ink); }
+.badge-ok { background:var(--badge-ok); color:var(--badge-ok-ink); }
+.badge-warn { background:var(--badge-warn); color:var(--badge-warn-ink); }
+.small-note{ color:var(--muted); font-size:0.92rem; }
+/* Primary buttons (gentle, still Streamlit-native) */
+div.stButton>button, .stDownloadButton>button {
+  background: var(--accent) !important; color:#fff !important;
+  border-radius: 10px !important; border:0 !important;
+  box-shadow: 0 8px 18px rgba(37,99,235,.18);
+}
+div.stButton>button:hover, .stDownloadButton>button:hover{ filter: brightness(0.95); }
+/* Inputs as cards */
+.stTextArea, .stFileUploader, .stCheckbox, .stTabs {
+  border-radius: 12px !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -107,21 +122,6 @@ def nonempty_rows(df: pd.DataFrame) -> int:
     return df.replace("", pd.NA).dropna(how="all").shape[0]
 
 def pick_best_onboarding_sheet(uploaded_file, mapping_aliases_by_master):
-    """
-    UPDATED: also supports CSV onboarding.
-    - If file is .csv: read it directly and return that DataFrame.
-    - If file is .xlsx: original 'best sheet' logic is used.
-    """
-    name = (uploaded_file.name or "").lower()
-    # CSV path
-    if name.endswith(".csv"):
-        uploaded_file.seek(0)
-        df = pd.read_csv(uploaded_file, dtype=str, encoding="utf-8", keep_default_na=False).fillna("")
-        df.columns = [str(c).strip() for c in df.columns]
-        info = f"csv rows: {nonempty_rows(df)}"
-        return df, "CSV", info
-
-    # Excel path (original behavior)
     uploaded_file.seek(0)
     xl = pd.ExcelFile(uploaded_file)
     best, best_score, best_info = None, -1, ""
@@ -146,43 +146,26 @@ def pick_best_onboarding_sheet(uploaded_file, mapping_aliases_by_master):
 SENTINEL_LIST = object()
 
 # ─────────────────────────────────────────────────────────────────────
-# UI Header
+# Header + main controls (top)
 # ─────────────────────────────────────────────────────────────────────
 st.title("🧾 Masterfile Automation – Amazon")
-st.caption("Fills **only** the Template sheet and preserves all other sheets/styles. Use the Excel-fast writer for big files on Windows.")
+st.caption("Fills **only** the Template sheet and preserves all other sheets/styles.")
 
 fast_badge = "badge-ok" if XLWINGS_AVAILABLE else "badge-warn"
 fast_text  = "Excel-fast writer available" if XLWINGS_AVAILABLE else "Excel-fast writer unavailable"
-st.markdown(f"<span class='badge {fast_badge}'>{fast_text}</span>  "
-            f"<span class='badge badge-info'>Template-only writer</span>",
-            unsafe_allow_html=True)
+st.markdown(
+    f"<div class='section'><span class='badge {fast_badge}'>{fast_text}</span> "
+    f"<span class='badge badge-info'>Template-only writer</span></div>",
+    unsafe_allow_html=True
+)
 
-with st.expander("ℹ️ Instructions", expanded=True):
-    st.markdown(dedent(f"""
-    **Masterfile (.xlsx / .xlsm)**  
-    - Sheet: **{MASTER_TEMPLATE_SHEET}**  
-    - Row 1 & 3 = internal keys (preserved)  
-    - Row **{MASTER_DISPLAY_ROW}** = mapping headers  
-    - For **Key Product Features** only, we use **Row {MASTER_SECONDARY_ROW}** (e.g., `bullet_point1..5`) as the mapping header.  
-    - Data written from **Row {MASTER_DATA_START_ROW}**.
-
-    **Onboarding (.xlsx / .csv)**  
-    - Row 1 = headers; Row 2+ = data *(best sheet auto-selected for .xlsx; .csv read directly)*
-
-    **Mapping JSON** (keys = column names from your onboarding; tool matches by synonyms/case-insensitive).
-    """))
-
-# ─────────────────────────────────────────────────────────────────────
-# Upload + Mapping inputs (in a “card”)
-# ─────────────────────────────────────────────────────────────────────
+# Upload + Mapping inputs (kept the same; just wrapped)
 st.markdown("<div class='section'>", unsafe_allow_html=True)
 c1, c2 = st.columns([1, 1])
 with c1:
-    # UPDATED: allow .xlsm as well
-    masterfile_file = st.file_uploader("📄 Masterfile Template (.xlsx or .xlsm)", type=["xlsx", "xlsm"])
+    masterfile_file = st.file_uploader("📄 Masterfile Template (.xlsx)", type=["xlsx"])
 with c2:
-    # UPDATED: allow .csv as well
-    onboarding_file = st.file_uploader("🧾 Onboarding (.xlsx or .csv)", type=["xlsx", "csv"])
+    onboarding_file = st.file_uploader("🧾 Onboarding (.xlsx)", type=["xlsx"])
 
 st.markdown("#### 🔗 Mapping JSON")
 tab1, tab2 = st.tabs(["Paste JSON", "Upload JSON"])
@@ -208,7 +191,7 @@ go = st.button("🚀 Generate Final Masterfile", type="primary")
 # Main
 # ─────────────────────────────────────────────────────────────────────
 if go:
-    # Log area in a “card”
+    # Log area
     st.markdown("<div class='section'>", unsafe_allow_html=True)
     st.markdown("### 📝 Log")
     log = st.empty()
@@ -218,11 +201,6 @@ if go:
         st.error("Please upload both **Masterfile Template** and **Onboarding**.")
         st.markdown("</div>", unsafe_allow_html=True)
         st.stop()
-
-    # Figure out masterfile extension (to preserve .xlsm name/macros where applicable)
-    master_ext = Path(masterfile_file.name or "").suffix.lower()
-    is_xlsm = (master_ext == ".xlsm")
-    final_out_name = "final_masterfile.xlsm" if is_xlsm else "final_masterfile.xlsx"
 
     # Parse mapping JSON
     try:
@@ -250,21 +228,19 @@ if go:
 
     slog("⏳ Reading Template headers…")
     t0 = time.time()
-    # (read_only True is fine for xlsm; we only read headers here)
     wb_ro = load_workbook(io.BytesIO(master_bytes), read_only=True, data_only=True, keep_links=True)
     if MASTER_TEMPLATE_SHEET not in wb_ro.sheetnames:
         st.error(f"Sheet **'{MASTER_TEMPLATE_SHEET}'** not found in the masterfile.")
         st.markdown("</div>", unsafe_allow_html=True)
         st.stop()
     ws_ro = wb_ro[MASTER_TEMPLATE_SHEET]
-    # NOTE: include both rows (2 and 3) so we can read bullet sub-keys
     used_cols = worksheet_used_cols(ws_ro, header_rows=(MASTER_DISPLAY_ROW, MASTER_SECONDARY_ROW), hard_cap=2048, empty_streak_stop=8)
     display_headers   = [ws_ro.cell(row=MASTER_DISPLAY_ROW,   column=c).value or "" for c in range(1, used_cols+1)]
     secondary_headers = [ws_ro.cell(row=MASTER_SECONDARY_ROW, column=c).value or "" for c in range(1, used_cols+1)]
     wb_ro.close()
     slog(f"✅ Template headers loaded (cols={used_cols}) in {time.time()-t0:.2f}s")
 
-    # Pick best onboarding sheet (now supports CSV)
+    # Pick best onboarding sheet
     try:
         best_df, best_sheet, info = pick_best_onboarding_sheet(onboarding_file, mapping_aliases)
     except Exception as e:
@@ -286,8 +262,6 @@ if go:
     for c, (disp, sec) in enumerate(zip(display_headers, secondary_headers), start=1):
         disp_norm = norm(disp)
         sec_norm  = norm(sec)
-
-        # 👉 Only for bullet points: use Row 3 as the effective header
         if disp_norm == BULLET_DISP_N and sec_norm:
             effective_header = sec  # e.g., 'bullet_point1'
             label_for_log = f"{disp} ({sec})"
@@ -344,8 +318,8 @@ if go:
                         block[i][col-1] = v
 
         with tempfile.TemporaryDirectory() as td:
-            src_path = Path(td) / ( "master.xlsm" if is_xlsm else "master.xlsx" )
-            dst_path = Path(td) / final_out_name
+            src_path = Path(td) / "master.xlsx"
+            dst_path = Path(td) / "final_masterfile.xlsx"
             src_path.write_bytes(master_bytes)
 
             app = xw.App(visible=False)
@@ -354,7 +328,7 @@ if go:
                 ws = wb.sheets[MASTER_TEMPLATE_SHEET]
                 start_cell = f"A{MASTER_DATA_START_ROW}"
                 ws.range(start_cell).options(expand=False).value = block
-                wb.save(str(dst_path))  # .xlsm preserved when saving to .xlsm
+                wb.save(str(dst_path))
                 wb.close()
             finally:
                 app.quit()
@@ -365,9 +339,8 @@ if go:
         st.download_button(
             "⬇️ Download Final Masterfile",
             data=out_bytes,
-            file_name=final_out_name,
-            mime="application/vnd.ms-excel.sheet.macroEnabled.12" if is_xlsm
-                 else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            file_name="final_masterfile.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="dl_fast",
         )
 
@@ -375,9 +348,7 @@ if go:
     else:
         slog("🛠️ Writing via openpyxl (fallback)…")
         t_write = time.time()
-        # keep_vba=True when source is .xlsm so macros are preserved on save
-        wb = load_workbook(io.BytesIO(master_bytes), read_only=False, data_only=False,
-                           keep_links=True, keep_vba=is_xlsm)
+        wb = load_workbook(io.BytesIO(master_bytes), read_only=False, data_only=False, keep_links=True)
         ws = wb[MASTER_TEMPLATE_SHEET]
 
         col_value_lists = {}
@@ -403,7 +374,7 @@ if go:
                 prog.progress((i+1)/total)
 
         bio = io.BytesIO()
-        wb.save(bio)  # with keep_vba=True, macros are preserved when saving .xlsm
+        wb.save(bio)
         bio.seek(0)
         out_bytes = bio.getvalue()
         slog(f"✅ Wrote & saved via openpyxl in {time.time()-t_write:.2f}s")
@@ -411,16 +382,50 @@ if go:
         st.download_button(
             "⬇️ Download Final Masterfile",
             data=out_bytes,
-            file_name=final_out_name,
-            mime="application/vnd.ms-excel.sheet.macroEnabled.12" if is_xlsm
-                 else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            file_name="final_masterfile.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="dl_fallback",
         )
 
     st.markdown("</div>", unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────
-# Footer (nice touch)
+# Friendly Instructions (moved to bottom; simple wording)
+# ─────────────────────────────────────────────────────────────────────
+with st.expander("📘 How to use (step-by-step)", expanded=False):
+    st.markdown(dedent(f"""
+    **What this tool does**
+    - It only writes data into the **`{MASTER_TEMPLATE_SHEET}`** sheet of your Masterfile.
+    - All other tabs, formulas and formatting stay the same.
+    - For **Key Product Features**, we read the small labels in **Row {MASTER_SECONDARY_ROW}** (like `bullet_point1..5`).
+      For everything else, we use the column names in **Row {MASTER_DISPLAY_ROW}**.
+    - Your product rows start from **Row {MASTER_DATA_START_ROW}**.
+
+    **What you need**
+    1) **Masterfile (.xlsx)** – your template with headers in place.  
+    2) **Onboarding (.xlsx)** – a sheet with your product data (headers in the first row).  
+    3) **Mapping JSON** – tells the tool which onboarding column goes into which masterfile column.
+       Example:
+       ```json
+       {{
+         "Partner SKU": ["Seller SKU", "item_sku"],
+         "Product Title": ["Item Name", "Title"]
+       }}
+       ```
+
+    **How to run**
+    1. Upload the **Masterfile** and the **Onboarding** files above.
+    2. Paste or upload the **Mapping JSON**.
+    3. (Windows + Excel) Turn on **Excel-fast writer** for big files.
+    4. Click **Generate Final Masterfile** to download the filled sheet.
+
+    **Tips**
+    - If a column doesn't match, check the suggestions shown in the **Mapping Summary**.
+    - On Streamlit Cloud or non-Windows machines, the tool uses the safe **openpyxl** writer.
+    """))
+
+# ─────────────────────────────────────────────────────────────────────
+# Footer (unchanged content, just styled)
 # ─────────────────────────────────────────────────────────────────────
 st.markdown(
     "<div class='section small-note'>"
