@@ -10,12 +10,22 @@ import tempfile
 import pandas as pd
 import streamlit as st
 from openpyxl import load_workbook
+import sys  # <-- added
 
-# Try fast path
+# Try fast path (usable only when Excel really exists)
 try:
     import xlwings as xw  # Windows + Excel only
-    XLWINGS_AVAILABLE = True
+    # Usable only on Windows with COM/Excel installed
+    if sys.platform.startswith("win"):
+        try:
+            import win32com.client  # verifies COM layer
+            XLWINGS_AVAILABLE = True
+        except Exception:
+            XLWINGS_AVAILABLE = False
+    else:
+        XLWINGS_AVAILABLE = False
 except Exception:
+    xw = None
     XLWINGS_AVAILABLE = False
 
 # ─────────────────────────────────────────────────────────────────────
@@ -38,11 +48,8 @@ st.markdown("""
   --badge-warn:#fff7ed; --badge-warn-ink:#9a3412;
   --badge-info:#eef2ff; --badge-info-ink:#1e40af;
 }
-/* App background (soft gradient) */
 .stApp { background: linear-gradient(180deg, var(--bg1) 0%, var(--bg2) 70%); }
-/* Main container spacing */
 .block-container { padding-top: 0.75rem; }
-/* Card-style sections */
 .section {
   border: 1px solid var(--card-border);
   background: var(--card);
@@ -51,10 +58,8 @@ st.markdown("""
   box-shadow: 0 6px 24px rgba(2, 6, 23, 0.05);
   margin-bottom: 18px;
 }
-/* Headings & hr */
 h1, h2, h3 { color: var(--ink); }
 hr { border-color: #eef2f7; }
-/* Badges */
 .badge {
   display:inline-block;padding:4px 10px;border-radius:999px;
   font-size:0.82rem;font-weight:600;letter-spacing:.2px;margin-right:.25rem
@@ -63,14 +68,12 @@ hr { border-color: #eef2f7; }
 .badge-ok { background:var(--badge-ok); color:var(--badge-ok-ink); }
 .badge-warn { background:var(--badge-warn); color:var(--badge-warn-ink); }
 .small-note{ color:var(--muted); font-size:0.92rem; }
-/* Primary buttons (gentle, still Streamlit-native) */
 div.stButton>button, .stDownloadButton>button {
   background: var(--accent) !important; color:#fff !important;
   border-radius: 10px !important; border:0 !important;
   box-shadow: 0 8px 18px rgba(37,99,235,.18);
 }
 div.stButton>button:hover, .stDownloadButton>button:hover{ filter: brightness(0.95); }
-/* Inputs as cards */
 .stTextArea, .stFileUploader, .stCheckbox, .stTabs {
   border-radius: 12px !important;
 }
@@ -214,7 +217,7 @@ if go:
         st.markdown("</div>", unsafe_allow_html=True)
         st.stop()
 
-    # Normalize mapping { master_norm: [alias1, alias2, ..., fallback master display] }
+    # Normalize mapping
     mapping_aliases = {}
     for k, v in mapping_raw.items():
         aliases = v[:] if isinstance(v, list) else [v]
@@ -299,52 +302,97 @@ if go:
 
     n_rows = len(on_df)
 
-    # FAST WRITE PATH (xlwings)
+    # FAST WRITE PATH (xlwings) — guarded and auto-fallback
     if use_fast and XLWINGS_AVAILABLE:
-        slog("⚡ Using Excel-fast writer (xlwings)…")
-        t_write = time.time()
+        try:
+            slog("⚡ Using Excel-fast writer (xlwings)…")
+            t_write = time.time()
 
-        block = [[""] * used_cols for _ in range(n_rows)]
-        for col, src in master_to_source.items():
-            if src is SENTINEL_LIST:
-                for i in range(n_rows):
-                    block[i][col-1] = "List"
-            else:
-                vals = src.astype(str).tolist()
-                m = min(len(vals), n_rows)
-                for i in range(m):
-                    v = vals[i].strip()
-                    if v and v.lower() not in ("nan", "none"):
-                        block[i][col-1] = v
+            block = [[""] * used_cols for _ in range(n_rows)]
+            for col, src in master_to_source.items():
+                if src is SENTINEL_LIST:
+                    for i in range(n_rows):
+                        block[i][col-1] = "List"
+                else:
+                    vals = src.astype(str).tolist()
+                    m = min(len(vals), n_rows)
+                    for i in range(m):
+                        v = vals[i].strip()
+                        if v and v.lower() not in ("nan", "none"):
+                            block[i][col-1] = v
 
-        with tempfile.TemporaryDirectory() as td:
-            src_path = Path(td) / "master.xlsx"
-            dst_path = Path(td) / "final_masterfile.xlsx"
-            src_path.write_bytes(master_bytes)
+            with tempfile.TemporaryDirectory() as td:
+                src_path = Path(td) / "master.xlsx"
+                dst_path = Path(td) / "final_masterfile.xlsx"
+                src_path.write_bytes(master_bytes)
 
-            app = xw.App(visible=False)
-            try:
-                wb = xw.Book(str(src_path))
-                ws = wb.sheets[MASTER_TEMPLATE_SHEET]
-                start_cell = f"A{MASTER_DATA_START_ROW}"
-                ws.range(start_cell).options(expand=False).value = block
-                wb.save(str(dst_path))
-                wb.close()
-            finally:
-                app.quit()
+                app = xw.App(visible=False, add_book=False)
+                try:
+                    wb = xw.Book(str(src_path))
+                    ws = wb.sheets[MASTER_TEMPLATE_SHEET]
+                    start_cell = f"A{MASTER_DATA_START_ROW}"
+                    ws.range(start_cell).options(expand=False).value = block
+                    wb.save(str(dst_path))
+                    wb.close()
+                finally:
+                    app.quit()
 
-            out_bytes = dst_path.read_bytes()
+                out_bytes = dst_path.read_bytes()
 
-        slog(f"✅ Wrote & saved via Excel in {time.time()-t_write:.2f}s")
-        st.download_button(
-            "⬇️ Download Final Masterfile",
-            data=out_bytes,
-            file_name="final_masterfile.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="dl_fast",
-        )
+            slog(f"✅ Wrote & saved via Excel in {time.time()-t_write:.2f}s")
+            st.download_button(
+                "⬇️ Download Final Masterfile",
+                data=out_bytes,
+                file_name="final_masterfile.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_fast",
+            )
 
-    # Fallback: openpyxl
+        except Exception as e:
+            slog(f"⚠️ Excel-fast writer not available here ({e.__class__.__name__}). "
+                 f"Switching to openpyxl fallback…")
+            # ---- FALLBACK (same as else path) ----
+            t_write = time.time()
+            wb = load_workbook(io.BytesIO(master_bytes), read_only=False, data_only=False, keep_links=True)
+            ws = wb[MASTER_TEMPLATE_SHEET]
+
+            col_value_lists = {}
+            for col, src in master_to_source.items():
+                if src is SENTINEL_LIST:
+                    continue
+                col_value_lists[col] = src.astype(str).tolist()
+
+            prog = st.progress(0)
+            total = max(1, n_rows)
+            for i in range(n_rows):
+                row_idx = MASTER_DATA_START_ROW + i
+                for col, src in master_to_source.items():
+                    if src is SENTINEL_LIST:
+                        ws.cell(row=row_idx, column=col, value="List")
+                    else:
+                        vals = col_value_lists[col]
+                        if i < len(vals):
+                            v = vals[i].strip()
+                            if v and v.lower() not in ("nan", "none", ""):
+                                ws.cell(row=row_idx, column=col, value=v)
+                if (i+1) % max(1, n_rows // 50) == 0:
+                    prog.progress((i+1)/total)
+
+            bio = io.BytesIO()
+            wb.save(bio)
+            bio.seek(0)
+            out_bytes = bio.getvalue()
+            slog(f"✅ Wrote & saved via openpyxl in {time.time()-t_write:.2f}s")
+
+            st.download_button(
+                "⬇️ Download Final Masterfile",
+                data=out_bytes,
+                file_name="final_masterfile.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_fallback_from_fast",
+            )
+
+    # Fallback: openpyxl (normal path when fast is unavailable/disabled)
     else:
         slog("🛠️ Writing via openpyxl (fallback)…")
         t_write = time.time()
@@ -405,13 +453,6 @@ with st.expander("📘 How to use (step-by-step)", expanded=False):
     1) **Masterfile (.xlsx)** – your template with headers in place.  
     2) **Onboarding (.xlsx)** – a sheet with your product data (headers in the first row).  
     3) **Mapping JSON** – tells the tool which onboarding column goes into which masterfile column.
-       Example:
-       ```json
-       {{
-         "Partner SKU": ["Seller SKU", "item_sku"],
-         "Product Title": ["Item Name", "Title"]
-       }}
-       ```
 
     **How to run**
     1. Upload the **Masterfile** and the **Onboarding** files above.
