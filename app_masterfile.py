@@ -7,15 +7,21 @@ from difflib import SequenceMatcher
 from textwrap import dedent
 from pathlib import Path
 import tempfile
+import sys
+
 import pandas as pd
 import streamlit as st
 from openpyxl import load_workbook
 
-# Try fast path
+# ─────────────────────────────────────────────────────────────────────
+# Robust xlwings detection (Excel-fast writer only on Win/macOS)
+# ─────────────────────────────────────────────────────────────────────
 try:
-    import xlwings as xw  # Windows + Excel only
-    XLWINGS_AVAILABLE = True
+    import xlwings as xw  # requires desktop Excel
+    XLWINGS_PLATFORM_OK = sys.platform.startswith("win") or sys.platform == "darwin"
+    XLWINGS_AVAILABLE = bool(xw) and XLWINGS_PLATFORM_OK
 except Exception:
+    xw = None
     XLWINGS_AVAILABLE = False
 
 # ─────────────────────────────────────────────────────────────────────
@@ -27,7 +33,6 @@ st.set_page_config(
     layout="wide"
 )
 
-# Polished theme
 st.markdown("""
 <style>
 :root{
@@ -38,11 +43,8 @@ st.markdown("""
   --badge-warn:#fff7ed; --badge-warn-ink:#9a3412;
   --badge-info:#eef2ff; --badge-info-ink:#1e40af;
 }
-/* App background (soft gradient) */
 .stApp { background: linear-gradient(180deg, var(--bg1) 0%, var(--bg2) 70%); }
-/* Main container spacing */
 .block-container { padding-top: 0.75rem; }
-/* Card-style sections */
 .section {
   border: 1px solid var(--card-border);
   background: var(--card);
@@ -51,10 +53,7 @@ st.markdown("""
   box-shadow: 0 6px 24px rgba(2, 6, 23, 0.05);
   margin-bottom: 18px;
 }
-/* Headings & hr */
-h1, h2, h3 { color: var(--ink); }
-hr { border-color: #eef2f7; }
-/* Badges */
+h1, h2, h3 { color: var(--ink); } hr { border-color: #eef2f7; }
 .badge {
   display:inline-block;padding:4px 10px;border-radius:999px;
   font-size:0.82rem;font-weight:600;letter-spacing:.2px;margin-right:.25rem
@@ -63,17 +62,13 @@ hr { border-color: #eef2f7; }
 .badge-ok { background:var(--badge-ok); color:var(--badge-ok-ink); }
 .badge-warn { background:var(--badge-warn); color:var(--badge-warn-ink); }
 .small-note{ color:var(--muted); font-size:0.92rem; }
-/* Primary buttons (gentle, still Streamlit-native) */
 div.stButton>button, .stDownloadButton>button {
   background: var(--accent) !important; color:#fff !important;
   border-radius: 10px !important; border:0 !important;
   box-shadow: 0 8px 18px rgba(37,99,235,.18);
 }
 div.stButton>button:hover, .stDownloadButton>button:hover{ filter: brightness(0.95); }
-/* Inputs as cards */
-.stTextArea, .stFileUploader, .stCheckbox, .stTabs {
-  border-radius: 12px !important;
-}
+.stTextArea, .stFileUploader, .stCheckbox, .stTabs { border-radius: 12px !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -82,7 +77,7 @@ div.stButton>button:hover, .stDownloadButton>button:hover{ filter: brightness(0.
 # ─────────────────────────────────────────────────────────────────────
 MASTER_TEMPLATE_SHEET = "Template"   # write only here
 MASTER_DISPLAY_ROW    = 2            # mapping row in master (normal headers)
-MASTER_SECONDARY_ROW  = 3            # ONLY used to disambiguate bullet points
+MASTER_SECONDARY_ROW  = 3            # used to disambiguate bullet points
 MASTER_DATA_START_ROW = 4            # first data row in master
 
 # ─────────────────────────────────────────────────────────────────────
@@ -149,7 +144,7 @@ SENTINEL_LIST = object()
 # Header + main controls (top)
 # ─────────────────────────────────────────────────────────────────────
 st.title("🧾 Masterfile Automation – Amazon")
-st.caption("Fills **only** the Template sheet and preserves all other sheets/styles.")
+st.caption("Fills only the Template sheet and preserves all other sheets/styles.")
 
 fast_badge = "badge-ok" if XLWINGS_AVAILABLE else "badge-warn"
 fast_text  = "Excel-fast writer available" if XLWINGS_AVAILABLE else "Excel-fast writer unavailable"
@@ -159,11 +154,12 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-# Upload + Mapping inputs (kept the same; just wrapped)
+# Upload + Mapping inputs (kept same)
 st.markdown("<div class='section'>", unsafe_allow_html=True)
 c1, c2 = st.columns([1, 1])
 with c1:
-    masterfile_file = st.file_uploader("📄 Masterfile Template (.xlsx)", type=["xlsx"])
+    # (keep your accepted types; if you want .xlsm just add it to the list)
+    masterfile_file = st.file_uploader("📄 Masterfile Template (.xlsx/.xlsm)", type=["xlsx", "xlsm"])
 with c2:
     onboarding_file = st.file_uploader("🧾 Onboarding (.xlsx)", type=["xlsx"])
 
@@ -177,7 +173,7 @@ with tab2:
     mapping_json_file = st.file_uploader("Or upload mapping.json", type=["json"], key="mapping_file")
 
 use_fast = st.checkbox(
-    "⚡ Use Excel-fast writer (xlwings, Windows + Excel)",
+    "⚡ Use Excel-fast writer (xlwings, Windows/macOS + Excel)",
     value=XLWINGS_AVAILABLE,
     disabled=not XLWINGS_AVAILABLE,
     help="Writes the whole data block in one shot via Excel. Falls back to openpyxl if unavailable."
@@ -210,7 +206,7 @@ if go:
         st.markdown("</div>", unsafe_allow_html=True)
         st.stop()
     if not isinstance(mapping_raw, dict):
-        st.error("Mapping JSON must be an object: {\"Master header\": [aliases...]}.")
+        st.error('Mapping JSON must be an object: {"Master header": [aliases...]}')
         st.markdown("</div>", unsafe_allow_html=True)
         st.stop()
 
@@ -274,7 +270,6 @@ if go:
             continue
 
         aliases = mapping_aliases.get(eff_norm, [effective_header])
-
         resolved = None
         for a in aliases:
             s = series_by_alias.get(norm(a))
@@ -296,80 +291,88 @@ if go:
                 report_lines.append(f"- ❌ **{label_for_log}** ← *no match*. Suggestions: {sug_txt}")
 
     st.markdown("\n".join(report_lines))
-
     n_rows = len(on_df)
 
-    # FAST WRITE PATH (xlwings)
+    # Build 2D block once for fast write
+    block = [[""] * used_cols for _ in range(n_rows)]
+    for col, src in master_to_source.items():
+        if src is SENTINEL_LIST:
+            for i in range(n_rows):
+                block[i][col-1] = "List"
+        else:
+            vals = src.astype(str).tolist()
+            m = min(len(vals), n_rows)
+            for i in range(m):
+                v = vals[i].strip()
+                if v and v.lower() not in ("nan", "none"):
+                    block[i][col-1] = v
+
+    # ---------- Excel-fast writer with safe fallback ----------
+    wrote_fast = False
     if use_fast and XLWINGS_AVAILABLE:
-        slog("⚡ Using Excel-fast writer (xlwings)…")
-        t_write = time.time()
+        try:
+            slog("⚡ Using Excel-fast writer (xlwings)…")
+            t_write = time.time()
 
-        block = [[""] * used_cols for _ in range(n_rows)]
-        for col, src in master_to_source.items():
-            if src is SENTINEL_LIST:
-                for i in range(n_rows):
-                    block[i][col-1] = "List"
-            else:
-                vals = src.astype(str).tolist()
-                m = min(len(vals), n_rows)
-                for i in range(m):
-                    v = vals[i].strip()
-                    if v and v.lower() not in ("nan", "none"):
-                        block[i][col-1] = v
+            with tempfile.TemporaryDirectory() as td:
+                # Preserve original extension (keeps macros if .xlsm)
+                ext = Path(masterfile_file.name).suffix.lower() or ".xlsx"
+                src_path = Path(td) / f"master{ext}"
+                dst_path = Path(td) / f"final_masterfile{ext}"
+                src_path.write_bytes(master_bytes)
 
-        with tempfile.TemporaryDirectory() as td:
-            src_path = Path(td) / "master.xlsx"
-            dst_path = Path(td) / "final_masterfile.xlsx"
-            src_path.write_bytes(master_bytes)
+                app = xw.App(visible=False, add_book=False)
+                try:
+                    # Turbo Excel
+                    app.display_alerts = False
+                    app.screen_updating = False
+                    xlCalcManual = -4135  # xlCalculationManual
+                    xlCalcAuto   = -4105  # xlCalculationAutomatic
+                    app.api.Calculation = xlCalcManual
 
-            app = xw.App(visible=False)
-            try:
-                wb = xw.Book(str(src_path))
-                ws = wb.sheets[MASTER_TEMPLATE_SHEET]
-                start_cell = f"A{MASTER_DATA_START_ROW}"
-                ws.range(start_cell).options(expand=False).value = block
-                wb.save(str(dst_path))
-                wb.close()
-            finally:
-                app.quit()
+                    wb = xw.Book(str(src_path))
+                    ws = wb.sheets[MASTER_TEMPLATE_SHEET]
+                    start_cell = f"A{MASTER_DATA_START_ROW}"
+                    ws.range(start_cell).resize(n_rows, used_cols).value = block
 
-            out_bytes = dst_path.read_bytes()
+                    wb.save(str(dst_path))
+                    wb.close()
+                    app.api.Calculation = xlCalcAuto
+                finally:
+                    app.quit()
 
-        slog(f"✅ Wrote & saved via Excel in {time.time()-t_write:.2f}s")
-        st.download_button(
-            "⬇️ Download Final Masterfile",
-            data=out_bytes,
-            file_name="final_masterfile.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="dl_fast",
-        )
+                out_bytes = dst_path.read_bytes()
 
-    # Fallback: openpyxl
-    else:
+            slog(f"✅ Wrote & saved via Excel in {time.time()-t_write:.2f}s")
+            st.download_button(
+                "⬇️ Download Final Masterfile",
+                data=out_bytes,
+                file_name=f"final_masterfile{ext}",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_fast",
+            )
+            wrote_fast = True
+
+        except Exception as e:
+            # Do NOT crash on Cloud/Linux — just fall back
+            slog(f"⚠️ Excel-fast writer unavailable here ({e.__class__.__name__}). Falling back to openpyxl…")
+
+    if not wrote_fast:
+        # ---------- openpyxl fallback (unchanged logic) ----------
         slog("🛠️ Writing via openpyxl (fallback)…")
         t_write = time.time()
         wb = load_workbook(io.BytesIO(master_bytes), read_only=False, data_only=False, keep_links=True)
         ws = wb[MASTER_TEMPLATE_SHEET]
 
-        col_value_lists = {}
-        for col, src in master_to_source.items():
-            if src is SENTINEL_LIST:
-                continue
-            col_value_lists[col] = src.astype(str).tolist()
-
         prog = st.progress(0)
         total = max(1, n_rows)
         for i in range(n_rows):
             row_idx = MASTER_DATA_START_ROW + i
-            for col, src in master_to_source.items():
-                if src is SENTINEL_LIST:
-                    ws.cell(row=row_idx, column=col, value="List")
-                else:
-                    vals = col_value_lists[col]
-                    if i < len(vals):
-                        v = vals[i].strip()
-                        if v and v.lower() not in ("nan", "none", ""):
-                            ws.cell(row=row_idx, column=col, value=v)
+            row_vals = block[i]
+            for col in range(1, used_cols + 1):
+                v = row_vals[col-1]
+                if v and str(v).strip().lower() not in ("nan", "none", ""):
+                    ws.cell(row=row_idx, column=col, value=v)
             if (i+1) % max(1, n_rows // 50) == 0:
                 prog.progress((i+1)/total)
 
@@ -390,7 +393,7 @@ if go:
     st.markdown("</div>", unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────
-# Friendly Instructions (moved to bottom; simple wording)
+# Friendly Instructions (bottom)
 # ─────────────────────────────────────────────────────────────────────
 with st.expander("📘 How to use (step-by-step)", expanded=False):
     st.markdown(dedent(f"""
@@ -402,34 +405,23 @@ with st.expander("📘 How to use (step-by-step)", expanded=False):
     - Your product rows start from **Row {MASTER_DATA_START_ROW}**.
 
     **What you need**
-    1) **Masterfile (.xlsx)** – your template with headers in place.  
+    1) **Masterfile (.xlsx/.xlsm)** – your template with headers in place.  
     2) **Onboarding (.xlsx)** – a sheet with your product data (headers in the first row).  
     3) **Mapping JSON** – tells the tool which onboarding column goes into which masterfile column.
-       Example:
-       ```json
-       {{
-         "Partner SKU": ["Seller SKU", "item_sku"],
-         "Product Title": ["Item Name", "Title"]
-       }}
-       ```
 
     **How to run**
     1. Upload the **Masterfile** and the **Onboarding** files above.
     2. Paste or upload the **Mapping JSON**.
-    3. (Windows + Excel) Turn on **Excel-fast writer** for big files.
+    3. (Windows/macOS + Excel) Turn on **Excel-fast writer** for big files.
     4. Click **Generate Final Masterfile** to download the filled sheet.
 
-    **Tips**
-    - If a column doesn't match, check the suggestions shown in the **Mapping Summary**.
-    - On Streamlit Cloud or non-Windows machines, the tool uses the safe **openpyxl** writer.
+    **Tip**
+    - On Linux/Streamlit Cloud, Excel isn’t available, so the app automatically uses the openpyxl writer.
     """))
 
-# ─────────────────────────────────────────────────────────────────────
-# Footer (unchanged content, just styled)
-# ─────────────────────────────────────────────────────────────────────
 st.markdown(
     "<div class='section small-note'>"
-    "Tip: For very large files on Windows, enable the <b>Excel-fast writer</b> above. "
+    "Tip: For very large files on Windows/macOS, enable the <b>Excel-fast writer</b> above. "
     "On Streamlit Cloud (Linux), the app automatically uses the openpyxl path."
     "</div>",
     unsafe_allow_html=True
