@@ -7,16 +7,27 @@ from difflib import SequenceMatcher
 from textwrap import dedent
 from pathlib import Path
 import tempfile
+import platform
 import pandas as pd
 import streamlit as st
 from openpyxl import load_workbook
 
-# Try fast path
+# ─────────────────────────────────────────────────────────────────────
+# xlwings: install vs. runtime availability (Excel required)
+# ─────────────────────────────────────────────────────────────────────
 try:
-    import xlwings as xw  # Windows + Excel only
-    XLWINGS_AVAILABLE = True
+    import xlwings as xw  # Windows/macOS + Excel only
+    XLWINGS_INSTALLED = True
 except Exception:
-    XLWINGS_AVAILABLE = False
+    xw = None
+    XLWINGS_INSTALLED = False
+
+def _xlwings_runtime_ok() -> bool:
+    """Return True if we're on a desktop OS that can host Excel."""
+    # Streamlit Cloud is Linux => False
+    return XLWINGS_INSTALLED and platform.system() in ("Windows", "Darwin")
+
+XLWINGS_AVAILABLE = _xlwings_runtime_ok()
 
 # ─────────────────────────────────────────────────────────────────────
 # Page meta + theming (visuals only; core logic unchanged)
@@ -159,11 +170,10 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-# Upload + Mapping inputs (kept the same; just wrapped)
+# Upload + Mapping inputs (kept the same; allow .xlsx/.xlsm for masterfile)
 st.markdown("<div class='section'>", unsafe_allow_html=True)
 c1, c2 = st.columns([1, 1])
 with c1:
-    # ACCEPT .xlsx AND .xlsm
     masterfile_file = st.file_uploader("📄 Masterfile Template (.xlsx / .xlsm)", type=["xlsx", "xlsm"])
 with c2:
     onboarding_file = st.file_uploader("🧾 Onboarding (.xlsx)", type=["xlsx"])
@@ -178,10 +188,10 @@ with tab2:
     mapping_json_file = st.file_uploader("Or upload mapping.json", type=["json"], key="mapping_file")
 
 use_fast = st.checkbox(
-    "⚡ Use Excel-fast writer (xlwings, Windows + Excel)",
+    "⚡ Use Excel-fast writer (xlwings, Windows/macOS + Excel)",
     value=XLWINGS_AVAILABLE,
     disabled=not XLWINGS_AVAILABLE,
-    help="Writes the whole data block in one shot via Excel. Falls back to openpyxl if unavailable."
+    help="Uses Excel via xlwings when available; otherwise the app automatically falls back to openpyxl."
 )
 st.markdown("</div>", unsafe_allow_html=True)
 
@@ -203,15 +213,6 @@ if go:
         st.markdown("</div>", unsafe_allow_html=True)
         st.stop()
 
-    # Remember original extension to preserve (.xlsx/.xlsm)
-    ext = (Path(masterfile_file.name).suffix or ".xlsx").lower()
-    # Pick correct MIME for download
-    mime_map = {
-        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        ".xlsm": "application/vnd.ms-excel.sheet.macroEnabled.12",
-    }
-    out_mime = mime_map.get(ext, mime_map[".xlsx"])
-
     # Parse mapping JSON
     try:
         mapping_raw = json.loads(mapping_json_text) if mapping_json_text.strip() else json.load(mapping_json_file)
@@ -220,7 +221,7 @@ if go:
         st.markdown("</div>", unsafe_allow_html=True)
         st.stop()
     if not isinstance(mapping_raw, dict):
-        st.error("Mapping JSON must be an object: {\"Master header\": [aliases...]}.")
+        st.error('Mapping JSON must be an object: {"Master header": [aliases...]}.')
         st.markdown("</div>", unsafe_allow_html=True)
         st.stop()
 
@@ -235,6 +236,15 @@ if go:
     # Read Template headers quickly
     masterfile_file.seek(0)
     master_bytes = masterfile_file.read()
+    # Extension & MIME handling
+    ext = Path(masterfile_file.name).suffix.lower()
+    if ext not in (".xlsx", ".xlsm"):
+        ext = ".xlsx"
+    out_mime = (
+        "application/vnd.ms-excel.sheet.macroEnabled.12"
+        if ext == ".xlsm" else
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
 
     slog("⏳ Reading Template headers…")
     t0 = time.time()
@@ -306,60 +316,65 @@ if go:
                 report_lines.append(f"- ❌ **{label_for_log}** ← *no match*. Suggestions: {sug_txt}")
 
     st.markdown("\n".join(report_lines))
-
     n_rows = len(on_df)
 
-    # FAST WRITE PATH (xlwings)
+    # ---------- Fast path (xlwings) with safe fallback ----------
+    did_fast = False
+
     if use_fast and XLWINGS_AVAILABLE:
-        slog("⚡ Using Excel-fast writer (xlwings)…")
-        t_write = time.time()
+        try:
+            slog("⚡ Using Excel-fast writer (xlwings)…")
+            t_write = time.time()
 
-        block = [[""] * used_cols for _ in range(n_rows)]
-        for col, src in master_to_source.items():
-            if src is SENTINEL_LIST:
-                for i in range(n_rows):
-                    block[i][col-1] = "List"
-            else:
-                vals = src.astype(str).tolist()
-                m = min(len(vals), n_rows)
-                for i in range(m):
-                    v = vals[i].strip()
-                    if v and v.lower() not in ("nan", "none"):
-                        block[i][col-1] = v
+            block = [[""] * used_cols for _ in range(n_rows)]
+            for col, src in master_to_source.items():
+                if src is SENTINEL_LIST:
+                    for i in range(n_rows):
+                        block[i][col-1] = "List"
+                else:
+                    vals = src.astype(str).tolist()
+                    m = min(len(vals), n_rows)
+                    for i in range(m):
+                        v = vals[i].strip()
+                        if v and v.lower() not in ("nan", "none"):
+                            block[i][col-1] = v
 
-        with tempfile.TemporaryDirectory() as td:
-            # preserve original extension (.xlsx/.xlsm)
-            src_path = Path(td) / f"master{ext}"
-            dst_path = Path(td) / f"final_masterfile{ext}"
-            src_path.write_bytes(master_bytes)
+            with tempfile.TemporaryDirectory() as td:
+                src_path = Path(td) / f"master{ext}"
+                dst_path = Path(td) / f"final_masterfile{ext}"
+                src_path.write_bytes(master_bytes)
 
-            app = xw.App(visible=False)
-            try:
-                wb = xw.Book(str(src_path))
-                ws = wb.sheets[MASTER_TEMPLATE_SHEET]
-                start_cell = f"A{MASTER_DATA_START_ROW}"
-                ws.range(start_cell).options(expand=False).value = block
-                wb.save(str(dst_path))
-                wb.close()
-            finally:
-                app.quit()
+                app = xw.App(visible=False)
+                try:
+                    wb = xw.Book(str(src_path))
+                    ws = wb.sheets[MASTER_TEMPLATE_SHEET]
+                    start_cell = f"A{MASTER_DATA_START_ROW}"
+                    ws.range(start_cell).options(expand=False).value = block
+                    wb.save(str(dst_path))
+                    wb.close()
+                finally:
+                    app.quit()
 
-            out_bytes = dst_path.read_bytes()
+                out_bytes = dst_path.read_bytes()
 
-        slog(f"✅ Wrote & saved via Excel in {time.time()-t_write:.2f}s")
-        st.download_button(
-            "⬇️ Download Final Masterfile",
-            data=out_bytes,
-            file_name=f"final_masterfile{ext}",
-            mime=out_mime,
-            key="dl_fast",
-        )
+            slog(f"✅ Wrote & saved via Excel in {time.time()-t_write:.2f}s")
+            st.download_button(
+                "⬇️ Download Final Masterfile",
+                data=out_bytes,
+                file_name=f"final_masterfile{ext}",
+                mime=out_mime,
+                key="dl_fast",
+            )
+            did_fast = True
 
-    # Fallback: openpyxl
-    else:
+        except Exception as e:
+            slog(f"⚠️ Excel-fast writer unavailable in this environment ({type(e).__name__}). Falling back to openpyxl…")
+            did_fast = False
+
+    # ---------- Fallback: openpyxl ----------
+    if not did_fast:
         slog("🛠️ Writing via openpyxl (fallback)…")
         t_write = time.time()
-        # keep_vba=True if template is .xlsm so macros are preserved
         wb = load_workbook(
             io.BytesIO(master_bytes),
             read_only=False,
@@ -391,8 +406,8 @@ if go:
             if (i+1) % max(1, n_rows // 50) == 0:
                 prog.progress((i+1)/total)
 
-        # Save: if .xlsm, write to a temp .xlsm file (BytesIO would default to .xlsx)
         if ext == ".xlsm":
+            # openpyxl can preserve macros if keep_vba=True, but saving to a real file is safest
             with tempfile.NamedTemporaryFile(suffix=".xlsm", delete=False) as tmp:
                 tmp_path = Path(tmp.name)
             wb.save(str(tmp_path))
@@ -446,12 +461,12 @@ with st.expander("📘 How to use (step-by-step)", expanded=False):
     **How to run**
     1. Upload the **Masterfile** and the **Onboarding** files above.
     2. Paste or upload the **Mapping JSON**.
-    3. (Windows + Excel) Turn on **Excel-fast writer** for big files.
+    3. (Windows/macOS + Excel) Turn on **Excel-fast writer** for big files.
     4. Click **Generate Final Masterfile** to download the filled sheet.
 
     **Tips**
     - If a column doesn't match, check the suggestions shown in the **Mapping Summary**.
-    - On Streamlit Cloud or non-Windows machines, the tool uses the safe **openpyxl** writer.
+    - On Streamlit Cloud or non-Windows/macOS machines, the tool uses the safe **openpyxl** writer.
     """))
 
 # ─────────────────────────────────────────────────────────────────────
@@ -459,7 +474,7 @@ with st.expander("📘 How to use (step-by-step)", expanded=False):
 # ─────────────────────────────────────────────────────────────────────
 st.markdown(
     "<div class='section small-note'>"
-    "Tip: For very large files on Windows, enable the <b>Excel-fast writer</b> above. "
+    "Tip: For very large files on Windows/macOS (with Excel installed), enable the <b>Excel-fast writer</b>. "
     "On Streamlit Cloud (Linux), the app automatically uses the openpyxl path."
     "</div>",
     unsafe_allow_html=True
