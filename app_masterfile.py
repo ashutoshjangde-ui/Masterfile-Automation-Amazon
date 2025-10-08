@@ -78,6 +78,42 @@ def _find_sheet_part_path(z: zipfile.ZipFile, sheet_name: str) -> str:
     return target  # e.g., xl/worksheets/sheet1.xml
 
 
+def _get_table_paths_for_sheet(z: zipfile.ZipFile, sheet_path: str) -> list:
+    rels_path = sheet_path.replace("worksheets/", "worksheets/_rels/").replace(".xml", ".xml.rels")
+    if rels_path not in z.namelist():
+        return []
+    root = ET.fromstring(z.read(rels_path))
+    out = []
+    for rel in root:
+        t = rel.attrib.get("Type", "")
+        if t.endswith("/table"):
+            target = rel.attrib.get("Target", "").replace("\\", "/")
+            if target.startswith("../"):
+                target = target[3:]
+            if not target.startswith("xl/"):
+                target = "xl/" + target
+            out.append(target)
+    return out
+
+
+def _read_table_cols_count(table_xml_bytes: bytes) -> int:
+    try:
+        root = ET.fromstring(table_xml_bytes)
+        tcols = root.find(f"{{{XL_NS_MAIN}}}tableColumns")
+        if tcols is None:
+            return 0
+        count_attr = tcols.attrib.get("count")
+        try:
+            count = int(count_attr) if count_attr is not None else 0
+        except Exception:
+            count = 0
+        # Ensure at least the number of child columns
+        child_count = sum(1 for _ in tcols)
+        return max(count, child_count)
+    except Exception:
+        return 0
+
+
 def _union_dimension(orig_dim_ref: str, used_cols: int, last_row: int) -> str:
     # Combine original dimension with our new area to avoid repairs
     try:
@@ -95,13 +131,13 @@ def _union_dimension(orig_dim_ref: str, used_cols: int, last_row: int) -> str:
     return f"A1:{_col_letter(u_last_col)}{u_last_row}"
 
 
-def _patch_sheet_xml(sheet_xml_bytes: bytes, start_row: int, used_cols: int, block_2d: list) -> bytes:
+def _patch_sheet_xml(sheet_xml_bytes: bytes, header_row: int, start_row: int, used_cols_final: int, block_2d: list) -> bytes:
     root = ET.fromstring(sheet_xml_bytes)
     sheetData = root.find(f"{{{XL_NS_MAIN}}}sheetData")
     if sheetData is None:
         sheetData = ET.SubElement(root, f"{{{XL_NS_MAIN}}}sheetData")
 
-    # Remove existing rows at/after start_row
+    # Remove existing rows at/after start_row (keep headers intact)
     for row in list(sheetData):
         try:
             r = int(row.attrib.get("r", "0") or "0")
@@ -111,15 +147,15 @@ def _patch_sheet_xml(sheet_xml_bytes: bytes, start_row: int, used_cols: int, blo
             sheetData.remove(row)
 
     # Append new rows with inline strings (sanitized) and row spans
-    row_span = f"1:{used_cols}" if used_cols > 0 else "1:1"
+    row_span = f"1:{used_cols_final}" if used_cols_final > 0 else "1:1"
     for i, row_vals in enumerate(block_2d):
         r = start_row + i
         row_el = ET.Element(f"{{{XL_NS_MAIN}}}row", r=str(r))
         row_el.set("spans", row_span)
         row_el.set("{http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac}dyDescent", "0.25")
         any_val = False
-        for j in range(used_cols):
-            v = row_vals[j]
+        for j in range(used_cols_final):
+            v = row_vals[j] if j < len(row_vals) else ""
             if not v:
                 continue
             txt = sanitize_xml_text(v)
@@ -136,24 +172,71 @@ def _patch_sheet_xml(sheet_xml_bytes: bytes, start_row: int, used_cols: int, blo
         if any_val:
             sheetData.append(row_el)
 
-    # Update dimension by unioning with original
+    # Update dimension by unioning with original and ensuring it covers the table width
     dim = root.find(f"{{{XL_NS_MAIN}}}dimension")
     if dim is None:
         dim = ET.SubElement(root, f"{{{XL_NS_MAIN}}}dimension")
         dim.set("ref", "A1:A1")
     last_row = start_row + max(0, len(block_2d) - 1)
-    new_ref = _union_dimension(dim.attrib.get("ref", "A1:A1"), used_cols, last_row)
+    new_ref = _union_dimension(dim.attrib.get("ref", "A1:A1"), used_cols_final, last_row)
     dim.set("ref", new_ref)
 
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
 
-def fast_patch_template(master_bytes: bytes, sheet_name: str, start_row: int, used_cols: int, block_2d: list) -> bytes:
-    """Return new workbook bytes with the Template sheet replaced by our bulk data."""
+def _patch_table_xml(table_xml_bytes: bytes, header_row: int, last_row: int, last_col_n: int) -> bytes:
+    root = ET.fromstring(table_xml_bytes)
+    new_ref = f"A{header_row}:{_col_letter(last_col_n)}{last_row}"
+    root.set("ref", new_ref)
+    af = root.find(f"{{{XL_NS_MAIN}}}autoFilter")
+    if af is None:
+        af = ET.SubElement(root, f"{{{XL_NS_MAIN}}}autoFilter")
+    af.set("ref", new_ref)
+    # Keep tableColumns count but don't rewrite columns list (safer)
+    tcols = root.find(f"{{{XL_NS_MAIN}}}tableColumns")
+    if tcols is not None:
+        # Ensure count is at least current children and not less than our width
+        child_count = sum(1 for _ in tcols)
+        new_count = max(child_count, last_col_n)
+        tcols.set("count", str(new_count))
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+def fast_patch_template(master_bytes: bytes, sheet_name: str, header_row: int, start_row: int, used_cols: int, block_2d: list) -> bytes:
+    """Return new workbook bytes with the Template sheet replaced by our bulk data and synced table ranges."""
     zin = zipfile.ZipFile(io.BytesIO(master_bytes), "r")
     sheet_path = _find_sheet_part_path(zin, sheet_name)
+    table_paths = _get_table_paths_for_sheet(zin, sheet_path)
+
+    # Determine final width: respect existing table column counts if larger than header width
+    max_cols = used_cols
+    table_cols_counts = []
+    for tp in table_paths:
+        try:
+            cnt = _read_table_cols_count(zin.read(tp))
+            if cnt:
+                table_cols_counts.append(cnt)
+                if cnt > max_cols:
+                    max_cols = cnt
+        except Exception:
+            pass
+
     original_sheet_xml = zin.read(sheet_path)
-    new_sheet_xml = _patch_sheet_xml(original_sheet_xml, start_row, used_cols, block_2d)
+    new_sheet_xml = _patch_sheet_xml(original_sheet_xml, header_row, start_row, max_cols, block_2d)
+
+    # Compute last row including data
+    last_row = start_row + max(0, len(block_2d) - 1)
+    if last_row < header_row:
+        last_row = header_row
+
+    # Prepare patched table xmls
+    patched_tables = {}
+    for tp in table_paths:
+        try:
+            patched_tables[tp] = _patch_table_xml(zin.read(tp), header_row, last_row, max_cols)
+        except Exception:
+            # If anything goes wrong, skip patching that table (Excel will still load)
+            pass
 
     out_bio = io.BytesIO()
     with zipfile.ZipFile(out_bio, "w", zipfile.ZIP_DEFLATED) as zout:
@@ -161,6 +244,8 @@ def fast_patch_template(master_bytes: bytes, sheet_name: str, start_row: int, us
             data = zin.read(item.filename)
             if item.filename == sheet_path:
                 data = new_sheet_xml
+            elif item.filename in patched_tables:
+                data = patched_tables[item.filename]
             zout.writestr(item, data)
     zin.close()
     out_bio.seek(0)
@@ -455,14 +540,15 @@ if go:
                     block[i][col-1] = v
 
     # ─────────────────────────────────────────────────────────────
-    # Writer: Linux-fast XML patch (only)
+    # Writer: Linux-fast XML patch (only) + table sync
     # ─────────────────────────────────────────────────────────────
-    slog("🚀 Using Linux-fast XML writer…")
+    slog("🚀 Using Linux-fast XML writer (with table sync)…")
     t_write = time.time()
 
     out_bytes = fast_patch_template(
         master_bytes=master_bytes,
         sheet_name=MASTER_TEMPLATE_SHEET,
+        header_row=MASTER_DISPLAY_ROW,
         start_row=MASTER_DATA_START_ROW,
         used_cols=used_cols,
         block_2d=block
@@ -498,7 +584,7 @@ with st.expander("📘 How to use (step-by-step)", expanded=False):
 
     **Notes**
     - Invalid XML control characters in inputs are auto-removed to prevent Excel repair prompts.
-    - The writer keeps namespaces/compatibility attributes to avoid the warning dialogs.
+    - Table ranges (and autofilter) are automatically synchronized to the new size to avoid repair dialogs.
     """))
 
 st.markdown(
