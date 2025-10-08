@@ -32,9 +32,6 @@ RANGE_RE = re.compile(r"^([A-Z]+)(\d+):([A-Z]+)(\d+)$")
 SHEET_A1_RE = re.compile(r"(?P<sheet>(?:'[^']+'|[^'!]+))!\$(?P<c1>[A-Z]+)\$(?P<r1>\d+):\$(?P<c2>[A-Z]+)\$(?P<r2>\d+)")
 SHEET_COL_ONLY_RE = re.compile(r"(?P<sheet>(?:'[^']+'|[^'!]+))!\$(?P<c1>[A-Z]+):\$(?P<c2>[A-Z]+)(?!\d)")
 SHEET_ROW_ONLY_RE = re.compile(r"(?P<sheet>(?:'[^']+'|[^'!]+))!\$(?P<r1>\d+):\$(?P<r2>\d+)(?![A-Za-z])")
-LOCAL_A1_RE = re.compile(r"\$(?P<c1>[A-Z]+)\$(?P<r1>\d+):\$(?P<c2>[A-Z]+)\$(?P<r2>\d+)")
-LOCAL_COL_ONLY_RE = re.compile(r"\$(?P<c1>[A-Z]+):\$(?P<c2>[A-Z]+)(?!\d)")
-LOCAL_ROW_ONLY_RE = re.compile(r"\$(?P<r1>\d+):\$(?P<r2>\d+)(?![A-Za-z])")
 
 SENTINEL_LIST = object()
 
@@ -275,7 +272,7 @@ def _patch_sheet_xml(sheet_xml_bytes: bytes, header_row: int, start_row: int, us
         if any_val:
             sheetData.append(row_el)
 
-    # Compute last row
+    # Compute last row/col
     last_row = max(header_row, start_row + max(0, len(block_2d) - 1))
     last_col_num = used_cols_final
 
@@ -490,8 +487,6 @@ with tab1:
 with tab2:
     mapping_json_file = st.file_uploader("Or upload mapping.json", type=["json"], key="mapping_file")
 
-zip_wrapper = st.checkbox("Download as ZIP wrapper (may avoid Protected View on some machines)", value=False)
-
 st.markdown("</div>", unsafe_allow_html=True)
 
 st.divider()
@@ -660,17 +655,10 @@ if go:
     )
     slog(f"✅ Wrote in {time.time()-t_write:.2f}s")
 
-    # Offer normal download; optional ZIP wrapper may help avoid Protected View on some systems
+    # Normal download (no ZIP wrapper UI)
     file_name = f"final_masterfile{ext}"
-    if not zip_wrapper:
-        st.download_button("⬇️ Download Final Masterfile", data=out_bytes, file_name=file_name,
-                           mime=("application/vnd.ms-excel.sheet.macroEnabled.12" if ext == ".xlsm" else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))
-    else:
-        zip_b = io.BytesIO()
-        with zipfile.ZipFile(zip_b, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr(file_name, out_bytes)
-        zip_b.seek(0)
-        st.download_button("⬇️ Download ZIP (contains Excel file)", data=zip_b.getvalue(), file_name=file_name.replace(ext, ".zip"), mime="application/zip")
+    st.download_button("⬇️ Download Final Masterfile", data=out_bytes, file_name=file_name,
+                       mime=("application/vnd.ms-excel.sheet.macroEnabled.12" if ext == ".xlsm" else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -680,5 +668,4 @@ with st.expander("📘 Notes", expanded=False):
     - Synchronizes **all** tables, sheet autoFilter, conditional formatting, validations, merges.
     - Clamps **Defined Names** (incl. Print_Titles / whole row/column ranges) to the new grid.
     - Removes `calcChain.xml` and its content-types entry so Excel rebuilds dependencies **without** repair dialogs.
-    - Protected View (MOTW) is an OS/Office security feature for internet downloads. Use a Trusted Location or the ZIP option if needed.
     """))
