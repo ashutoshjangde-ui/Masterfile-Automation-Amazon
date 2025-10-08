@@ -12,12 +12,7 @@ import pandas as pd
 import streamlit as st
 from openpyxl import load_workbook
 
-# Try fast path
-try:
-    import xlwings as xw  # Windows + Excel only
-    XLWINGS_AVAILABLE = True
-except Exception:
-    XLWINGS_AVAILABLE = False
+# xlwings REMOVED — we now use only the Linux-fast XML patch writer.
 
 # ─────────────────────────────────────────────────────────────────────
 # FAST XML PATCH WRITER (Linux-fast) — preserves all other sheets/styles/macros
@@ -26,6 +21,19 @@ XL_NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 XL_NS_REL  = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 ET.register_namespace("", XL_NS_MAIN)
 ET.register_namespace("r", XL_NS_REL)
+# Optional namespaces commonly present in Excel sheets; keeping them prevents repair prompts
+ET.register_namespace("mc", "http://schemas.openxmlformats.org/markup-compatibility/2006")
+ET.register_namespace("x14ac", "http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac")
+
+# Remove characters that are invalid in XML 1.0 (prevents Excel repair dialogs)
+_INVALID_XML_CHARS = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\uD800-\uDFFF]")
+
+def sanitize_xml_text(s) -> str:
+    if s is None:
+        return ""
+    s = str(s)
+    return _INVALID_XML_CHARS.sub("", s)
+
 
 def _col_letter(n: int) -> str:
     s = ""
@@ -33,6 +41,16 @@ def _col_letter(n: int) -> str:
         n, r = divmod(n-1, 26)
         s = chr(65+r) + s
     return s
+
+
+def _col_number(letters: str) -> int:
+    n = 0
+    for ch in letters:
+        if not ch.isalpha():
+            break
+        n = n * 26 + (ord(ch.upper()) - 64)
+    return n
+
 
 def _find_sheet_part_path(z: zipfile.ZipFile, sheet_name: str) -> str:
     wb_xml = ET.fromstring(z.read("xl/workbook.xml"))
@@ -60,46 +78,72 @@ def _find_sheet_part_path(z: zipfile.ZipFile, sheet_name: str) -> str:
     return target  # e.g., xl/worksheets/sheet1.xml
 
 
+def _union_dimension(orig_dim_ref: str, used_cols: int, last_row: int) -> str:
+    # Combine original dimension with our new area to avoid repairs
+    try:
+        _, right = orig_dim_ref.split(":", 1)
+        m = re.match(r"([A-Z]+)(\d+)", right)
+        if m:
+            orig_last_col = _col_number(m.group(1))
+            orig_last_row = int(m.group(2))
+        else:
+            orig_last_col, orig_last_row = used_cols, last_row
+    except Exception:
+        orig_last_col, orig_last_row = used_cols, last_row
+    u_last_col = max(orig_last_col, used_cols)
+    u_last_row = max(orig_last_row, last_row)
+    return f"A1:{_col_letter(u_last_col)}{u_last_row}"
+
+
 def _patch_sheet_xml(sheet_xml_bytes: bytes, start_row: int, used_cols: int, block_2d: list) -> bytes:
     root = ET.fromstring(sheet_xml_bytes)
     sheetData = root.find(f"{{{XL_NS_MAIN}}}sheetData")
     if sheetData is None:
         sheetData = ET.SubElement(root, f"{{{XL_NS_MAIN}}}sheetData")
 
-    # remove existing rows at/after start_row
+    # Remove existing rows at/after start_row
     for row in list(sheetData):
-        r = int(row.attrib.get("r", "0") or "0")
+        try:
+            r = int(row.attrib.get("r", "0") or "0")
+        except Exception:
+            r = 0
         if r >= start_row:
             sheetData.remove(row)
 
-    # append new rows with inline strings
+    # Append new rows with inline strings (sanitized) and row spans
+    row_span = f"1:{used_cols}" if used_cols > 0 else "1:1"
     for i, row_vals in enumerate(block_2d):
         r = start_row + i
         row_el = ET.Element(f"{{{XL_NS_MAIN}}}row", r=str(r))
+        row_el.set("spans", row_span)
+        row_el.set("{http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac}dyDescent", "0.25")
         any_val = False
         for j in range(used_cols):
             v = row_vals[j]
             if not v:
+                continue
+            txt = sanitize_xml_text(v)
+            if txt == "":
                 continue
             any_val = True
             col = _col_letter(j+1)
             c = ET.Element(f"{{{XL_NS_MAIN}}}c", r=f"{col}{r}", t="inlineStr")
             is_el = ET.SubElement(c, f"{{{XL_NS_MAIN}}}is")
             t_el = ET.SubElement(is_el, f"{{{XL_NS_MAIN}}}t")
-            # preserve spaces exactly
             t_el.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
-            t_el.text = str(v)
+            t_el.text = txt
             row_el.append(c)
         if any_val:
             sheetData.append(row_el)
 
-    # update dimension
+    # Update dimension by unioning with original
     dim = root.find(f"{{{XL_NS_MAIN}}}dimension")
     if dim is None:
         dim = ET.SubElement(root, f"{{{XL_NS_MAIN}}}dimension")
-    last_row = start_row + max(0, len(block_2d)-1)
-    last_col = _col_letter(used_cols)
-    dim.set("ref", f"A1:{last_col}{max(last_row, start_row)}")
+        dim.set("ref", "A1:A1")
+    last_row = start_row + max(0, len(block_2d) - 1)
+    new_ref = _union_dimension(dim.attrib.get("ref", "A1:A1"), used_cols, last_row)
+    dim.set("ref", new_ref)
 
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
@@ -168,7 +212,7 @@ div.stButton>button, .stDownloadButton>button {
   box-shadow: 0 8px 18px rgba(37,99,235,.18);
 }
 div.stButton>button:hover, .stDownloadButton>button:hover{ filter: brightness(0.95); }
-.stTextArea, .stFileUploader, .stCheckbox, .stTabs {
+.stTextArea, .stFileUploader, .stTabs {
   border-radius: 12px !important;
 }
 </style>
@@ -248,11 +292,9 @@ SENTINEL_LIST = object()
 st.title("🧾 Masterfile Automation – Amazon")
 st.caption("Fills **only** the Template sheet and preserves all other sheets/styles.")
 
-fast_badge = "badge-ok" if XLWINGS_AVAILABLE else "badge-warn"
-fast_text  = "Excel-fast writer available" if XLWINGS_AVAILABLE else "Excel-fast writer unavailable"
 st.markdown(
-    f"<div class='section'><span class='badge {fast_badge}'>{fast_text}</span> "
-    f"<span class='badge badge-info'>Template-only writer</span></div>",
+    f"<div class='section'><span class='badge badge-info'>Template-only writer</span>"
+    f" <span class='badge badge-ok'>Linux-fast XML patch</span></div>",
     unsafe_allow_html=True
 )
 
@@ -269,23 +311,9 @@ tab1, tab2 = st.tabs(["Paste JSON", "Upload JSON"])
 mapping_json_text, mapping_json_file = "", None
 with tab1:
     mapping_json_text = st.text_area("Paste mapping JSON", height=200,
-                                     placeholder='{\n  "Partner SKU": ["Seller SKU", "item_sku"]\n}')
+                                     placeholder='\n{\n  "Partner SKU": ["Seller SKU", "item_sku"]\n}\n')
 with tab2:
     mapping_json_file = st.file_uploader("Or upload mapping.json", type=["json"], key="mapping_file")
-
-use_fast = st.checkbox(
-    "⚡ Use Excel-fast writer (xlwings, Windows + Excel)",
-    value=XLWINGS_AVAILABLE,
-    disabled=not XLWINGS_AVAILABLE,
-    help="Writes the whole data block in one shot via Excel. Falls back to openpyxl if unavailable."
-)
-
-# NEW: Linux-fast XML writer toggle (best for Streamlit Cloud)
-use_linux_fast = st.checkbox(
-    "⚡ Use Linux-fast writer (XML patch)",
-    value=True,
-    help="Very fast on Streamlit Cloud. Preserves other sheets, styles, and macros."
-)
 
 st.markdown("</div>", unsafe_allow_html=True)
 
@@ -412,7 +440,7 @@ if go:
 
     n_rows = len(on_df)
 
-    # Build a 2D block once for fast writers (and can be reused by xlwings)
+    # Build a 2D block once for fast writer
     block = [[""] * used_cols for _ in range(n_rows)]
     for col, src in master_to_source.items():
         if src is SENTINEL_LIST:
@@ -422,123 +450,32 @@ if go:
             vals = src.astype(str).tolist()
             m = min(len(vals), n_rows)
             for i in range(m):
-                v = vals[i].strip()
+                v = sanitize_xml_text(vals[i].strip())
                 if v and v.lower() not in ("nan", "none", ""):
                     block[i][col-1] = v
 
     # ─────────────────────────────────────────────────────────────
-    # Writers
+    # Writer: Linux-fast XML patch (only)
     # ─────────────────────────────────────────────────────────────
-    if use_fast and XLWINGS_AVAILABLE:
-        slog("⚡ Using Excel-fast writer (xlwings)…")
-        t_write = time.time()
+    slog("🚀 Using Linux-fast XML writer…")
+    t_write = time.time()
 
-        with tempfile.TemporaryDirectory() as td:
-            src_path = Path(td) / f"master{ext}"
-            dst_path = Path(td) / f"final_masterfile{ext}"
-            src_path.write_bytes(master_bytes)
+    out_bytes = fast_patch_template(
+        master_bytes=master_bytes,
+        sheet_name=MASTER_TEMPLATE_SHEET,
+        start_row=MASTER_DATA_START_ROW,
+        used_cols=used_cols,
+        block_2d=block
+    )
 
-            app = xw.App(visible=False)
-            try:
-                wb = xw.Book(str(src_path))
-                ws = wb.sheets[MASTER_TEMPLATE_SHEET]
-                start_cell = f"A{MASTER_DATA_START_ROW}"
-                ws.range(start_cell).options(expand=False).value = block
-                wb.save(str(dst_path))
-                wb.close()
-            finally:
-                app.quit()
-
-            out_bytes = dst_path.read_bytes()
-
-        slog(f"✅ Wrote & saved via Excel in {time.time()-t_write:.2f}s")
-        st.download_button(
-            "⬇️ Download Final Masterfile",
-            data=out_bytes,
-            file_name=f"final_masterfile{ext}",
-            mime=out_mime,
-            key="dl_fast",
-        )
-
-    elif use_linux_fast:
-        slog("🚀 Using Linux-fast XML writer…")
-        t_write = time.time()
-
-        out_bytes = fast_patch_template(
-            master_bytes=master_bytes,
-            sheet_name=MASTER_TEMPLATE_SHEET,
-            start_row=MASTER_DATA_START_ROW,
-            used_cols=used_cols,
-            block_2d=block
-        )
-
-        slog(f"✅ Wrote & saved via XML patch in {time.time()-t_write:.2f}s")
-        st.download_button(
-            "⬇️ Download Final Masterfile",
-            data=out_bytes,
-            file_name=f"final_masterfile{ext}",
-            mime=out_mime,
-            key="dl_xmlfast",
-        )
-
-    else:
-        # Fallback: openpyxl per-cell write
-        slog("🛠️ Writing via openpyxl (fallback)…")
-        t_write = time.time()
-        wb = load_workbook(
-            io.BytesIO(master_bytes),
-            read_only=False,
-            data_only=False,
-            keep_links=True,
-            keep_vba=(ext == ".xlsm"),
-        )
-        ws = wb[MASTER_TEMPLATE_SHEET]
-
-        col_value_lists = {}
-        for col, src in master_to_source.items():
-            if src is SENTINEL_LIST:
-                continue
-            col_value_lists[col] = src.astype(str).tolist()
-
-        prog = st.progress(0)
-        total = max(1, n_rows)
-        for i in range(n_rows):
-            row_idx = MASTER_DATA_START_ROW + i
-            for col, src in master_to_source.items():
-                if src is SENTINEL_LIST:
-                    ws.cell(row=row_idx, column=col, value="List")
-                else:
-                    vals = col_value_lists[col]
-                    if i < len(vals):
-                        v = vals[i].strip()
-                        if v and v.lower() not in ("nan", "none", ""):
-                            ws.cell(row=row_idx, column=col, value=v)
-            if (i+1) % max(1, n_rows // 50) == 0:
-                prog.progress((i+1)/total)
-
-        if ext == ".xlsm":
-            with tempfile.NamedTemporaryFile(suffix=".xlsm", delete=False) as tmp:
-                tmp_path = Path(tmp.name)
-            wb.save(str(tmp_path))
-            out_bytes = tmp_path.read_bytes()
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-        else:
-            bio = io.BytesIO()
-            wb.save(bio)
-            bio.seek(0)
-            out_bytes = bio.getvalue()
-
-        slog(f"✅ Wrote & saved via openpyxl in {time.time()-t_write:.2f}s")
-        st.download_button(
-            "⬇️ Download Final Masterfile",
-            data=out_bytes,
-            file_name=f"final_masterfile{ext}",
-            mime=out_mime,
-            key="dl_fallback",
-        )
+    slog(f"✅ Wrote & saved via XML patch in {time.time()-t_write:.2f}s")
+    st.download_button(
+        "⬇️ Download Final Masterfile",
+        data=out_bytes,
+        file_name=f"final_masterfile{ext}",
+        mime=out_mime,
+        key="dl_xmlfast",
+    )
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -554,34 +491,19 @@ with st.expander("📘 How to use (step-by-step)", expanded=False):
       For everything else, we use the column names in **Row {MASTER_DISPLAY_ROW}``.
     - Your product rows start from **Row {MASTER_DATA_START_ROW}**.
 
-    **What you need**
-    1) **Masterfile (.xlsx / .xlsm)** – your template with headers in place.  
-    2) **Onboarding (.xlsx)** – a sheet with your product data (headers in the first row).  
-    3) **Mapping JSON** – tells the tool which onboarding column goes into which masterfile column.
-       Example:
-       ```json
-       {{
-         "Partner SKU": ["Seller SKU", "item_sku"],
-         "Product Title": ["Item Name", "Title"]
-       }}
-       ```
-
     **How to run**
-    1. Upload the **Masterfile** and the **Onboarding** files above.
+    1. Upload the **Masterfile** (.xlsx / .xlsm) and the **Onboarding** (.xlsx) files above.
     2. Paste or upload the **Mapping JSON**.
-    3. (Windows + Excel) Turn on **Excel-fast writer** for big files.
-    4. Otherwise, leave **Linux-fast writer** on (recommended for Streamlit Cloud).
-    5. Click **Generate Final Masterfile** to download the filled sheet.
+    3. Click **Generate Final Masterfile** to download the filled sheet (Linux-fast).
 
-    **Tips**
-    - If a column doesn't match, check the suggestions shown in the **Mapping Summary**.
-    - On Streamlit Cloud or non-Windows machines, the **Linux-fast** path is the fastest and preserves everything (including macros in .xlsm).
+    **Notes**
+    - Invalid XML control characters in inputs are auto-removed to prevent Excel repair prompts.
+    - The writer keeps namespaces/compatibility attributes to avoid the warning dialogs.
     """))
 
 st.markdown(
     "<div class='section small-note'>"
-    "Tip: For very large files on Windows, enable the <b>Excel-fast writer</b> above. "
-    "On Streamlit Cloud (Linux), the app automatically uses the <b>Linux-fast</b> path if enabled."
+    "On Streamlit Cloud (Linux), the app uses the Linux-fast XML path and preserves macros/styles."
     "</div>",
     unsafe_allow_html=True
 )
