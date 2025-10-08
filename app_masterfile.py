@@ -7,40 +7,32 @@ import xml.etree.ElementTree as ET
 from difflib import SequenceMatcher
 from textwrap import dedent
 from pathlib import Path
+import tempfile
 import pandas as pd
 import streamlit as st
 from openpyxl import load_workbook
 
-# xlwings REMOVED — Linux-fast XML patch writer only
+# xlwings REMOVED — we now use only the Linux-fast XML patch writer.
 
 # ─────────────────────────────────────────────────────────────────────
-# FAST XML PATCH WRITER (Linux-fast) — preserves other sheets/styles/macros
-# and prevents Excel repair prompts by:
-#  - syncing all tables tied to the sheet
-#  - clamping autoFilter, conditional formatting, data validations, merges
-#  - clamping defined names that point into the sheet
-#  - removing xl/calcChain.xml (Excel rebuilds silently)
+# FAST XML PATCH WRITER (Linux-fast) — preserves all other sheets/styles/macros
 # ─────────────────────────────────────────────────────────────────────
 XL_NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 XL_NS_REL  = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 ET.register_namespace("", XL_NS_MAIN)
 ET.register_namespace("r", XL_NS_REL)
+# Optional namespaces commonly present in Excel sheets; keeping them prevents repair prompts
 ET.register_namespace("mc", "http://schemas.openxmlformats.org/markup-compatibility/2006")
 ET.register_namespace("x14ac", "http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac")
 
+# Remove characters that are invalid in XML 1.0 (prevents Excel repair dialogs)
 _INVALID_XML_CHARS = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\uD800-\uDFFF]")
-CELL_RE  = re.compile(r"^([A-Z]+)(\d+)$")
-RANGE_RE = re.compile(r"^([A-Z]+)(\d+):([A-Z]+)(\d+)$")
-# defined-name patterns
-SHEET_A1_RE = re.compile(r"(?P<sheet>(?:'[^']+'|[^'!]+))!\$(?P<c1>[A-Z]+)\$(?P<r1>\d+):\$(?P<c2>[A-Z]+)\$(?P<r2>\d+)")
-SHEET_COL_ONLY_RE = re.compile(r"(?P<sheet>(?:'[^']+'|[^'!]+))!\$(?P<c1>[A-Z]+):\$(?P<c2>[A-Z]+)(?!\d)")
-SHEET_ROW_ONLY_RE = re.compile(r"(?P<sheet>(?:'[^']+'|[^'!]+))!\$(?P<r1>\d+):\$(?P<r2>\d+)(?![A-Za-z])")
-
 
 def sanitize_xml_text(s) -> str:
     if s is None:
         return ""
-    return _INVALID_XML_CHARS.sub("", str(s))
+    s = str(s)
+    return _INVALID_XML_CHARS.sub("", s)
 
 
 def _col_letter(n: int) -> str:
@@ -59,22 +51,6 @@ def _col_number(letters: str) -> int:
         n = n * 26 + (ord(ch.upper()) - 64)
     return n
 
-
-def _parse_range(ref: str):
-    m = RANGE_RE.match(ref or "")
-    if not m:
-        return ("A", 1, "A", 1)
-    return m.group(1), int(m.group(2)), m.group(3), int(m.group(4))
-
-
-def _norm_sheet_name(n: str) -> str:
-    n = n.strip()
-    if n.startswith("'") and n.endswith("'"):
-        n = n[1:-1]
-    return n
-
-
-# Workbook/Sheet/Table discovery
 
 def _find_sheet_part_path(z: zipfile.ZipFile, sheet_name: str) -> str:
     wb_xml = ET.fromstring(z.read("xl/workbook.xml"))
@@ -120,22 +96,29 @@ def _get_table_paths_for_sheet(z: zipfile.ZipFile, sheet_path: str) -> list:
     return out
 
 
-def _read_table_info(table_xml_bytes: bytes):
-    """Return (start_col_letter, header_row_from_ref, width_by_columns)."""
-    root = ET.fromstring(table_xml_bytes)
-    ref = root.attrib.get("ref", "A1:A1")
-    sc, sr, ec, er = _parse_range(ref)
-    tcols = root.find(f"{{{XL_NS_MAIN}}}tableColumns")
-    width = sum(1 for _ in tcols) if tcols is not None else (_col_number(ec) - _col_number(sc) + 1)
-    return sc, sr, width
+def _read_table_cols_count(table_xml_bytes: bytes) -> int:
+    try:
+        root = ET.fromstring(table_xml_bytes)
+        tcols = root.find(f"{{{XL_NS_MAIN}}}tableColumns")
+        if tcols is None:
+            return 0
+        count_attr = tcols.attrib.get("count")
+        try:
+            count = int(count_attr) if count_attr is not None else 0
+        except Exception:
+            count = 0
+        # Ensure at least the number of child columns
+        child_count = sum(1 for _ in tcols)
+        return max(count, child_count)
+    except Exception:
+        return 0
 
-
-# Clamping helpers
 
 def _union_dimension(orig_dim_ref: str, used_cols: int, last_row: int) -> str:
+    # Combine original dimension with our new area to avoid repairs
     try:
-        _, right = (orig_dim_ref or "A1:A1").split(":", 1)
-        m = CELL_RE.match(right)
+        _, right = orig_dim_ref.split(":", 1)
+        m = re.match(r"([A-Z]+)(\d+)", right)
         if m:
             orig_last_col = _col_number(m.group(1))
             orig_last_row = int(m.group(2))
@@ -148,109 +131,13 @@ def _union_dimension(orig_dim_ref: str, used_cols: int, last_row: int) -> str:
     return f"A1:{_col_letter(u_last_col)}{u_last_row}"
 
 
-def _clamp_coords(c1, r1, c2, r2, last_col, last_row):
-    c1n = max(1, min(_col_number(c1), last_col))
-    c2n = max(1, min(_col_number(c2), last_col))
-    r1c = max(1, min(int(r1), last_row))
-    r2c = max(1, min(int(r2), last_row))
-    if c2n < c1n: c1n, c2n = c2n, c1n
-    if r2c < r1c: r1c, r2c = r2c, r1c
-    return _col_letter(c1n), r1c, _col_letter(c2n), r2c
-
-
-def _clamp_sqref_list(sqref: str, last_col: int, last_row: int) -> str:
-    if not sqref:
-        return sqref
-    parts, out = sqref.split(), []
-    for p in parts:
-        m = RANGE_RE.match(p)
-        if not m:
-            out.append(p); continue
-        c1, r1, c2, r2 = m.group(1), int(m.group(2)), m.group(3), int(m.group(4))
-        c1L, r1N, c2L, r2N = _clamp_coords(c1, r1, c2, r2, last_col, last_row)
-        out.append(f"{c1L}{r1N}:{c2L}{r2N}")
-    return " ".join(out)
-
-
-def _clamp_ref(ref: str, last_col: int, last_row: int) -> str:
-    m = RANGE_RE.match(ref or "")
-    if not m:
-        return ref
-    c1, r1, c2, r2 = m.group(1), int(m.group(2)), m.group(3), int(m.group(4))
-    c1L, r1N, c2L, r2N = _clamp_coords(c1, r1, c2, r2, last_col, last_row)
-    return f"{c1L}{r1N}:{c2L}{r2N}"
-
-
-def _clamp_defined_names(workbook_xml_bytes: bytes, sheet_name: str, last_col: int, last_row: int) -> bytes:
-    try:
-        root = ET.fromstring(workbook_xml_bytes)
-        dnames = root.find(f"{{{XL_NS_MAIN}}}definedNames")
-        if dnames is None:
-            return workbook_xml_bytes
-
-        def clamp_text(text: str) -> str:
-            if not text:
-                return text
-
-            def repl_a1(m):
-                sname = _norm_sheet_name(m.group("sheet"))
-                if sname.lower() != sheet_name.lower():
-                    return m.group(0)
-                c1, r1, c2, r2 = m.group("c1"), m.group("r1"), m.group("c2"), m.group("r2")
-                c1L, r1N, c2L, r2N = _clamp_coords(c1, r1, c2, r2, last_col, last_row)
-                return f"{m.group('sheet')}!${c1L}${r1N}:${c2L}${r2N}"
-            text = SHEET_A1_RE.sub(repl_a1, text)
-
-            def repl_col(m):
-                sname = _norm_sheet_name(m.group("sheet"))
-                if sname.lower() != sheet_name.lower():
-                    return m.group(0)
-                c1, c2 = m.group("c1"), m.group("c2")
-                c1n = max(1, min(_col_number(c1), last_col))
-                c2n = max(1, min(_col_number(c2), last_col))
-                if c2n < c1n: c1n, c2n = c2n, c1n
-                return f"{m.group('sheet')}!${_col_letter(c1n)}:${_col_letter(c2n)}"
-            text = SHEET_COL_ONLY_RE.sub(repl_col, text)
-
-            def repl_row(m):
-                sname = _norm_sheet_name(m.group("sheet"))
-                if sname.lower() != sheet_name.lower():
-                    return m.group(0)
-                r1, r2 = int(m.group("r1")), int(m.group("r2"))
-                r1c = max(1, min(r1, last_row))
-                r2c = max(1, min(r2, last_row))
-                if r2c < r1c: r1c, r2c = r2c, r1c
-                return f"{m.group('sheet')}!${r1c}:${r2c}"
-            text = SHEET_ROW_ONLY_RE.sub(repl_row, text)
-            return text
-
-        for dn in list(dnames):
-            dn.text = clamp_text(dn.text or "")
-        return ET.tostring(root, encoding="utf-8", xml_declaration=True)
-    except Exception:
-        return workbook_xml_bytes
-
-
-def _strip_calcchain_from_content_types(ct_bytes: bytes) -> bytes:
-    try:
-        root = ET.fromstring(ct_bytes)
-        for child in list(root):
-            if child.tag.endswith('Override') and child.attrib.get('PartName') == '/xl/calcChain.xml':
-                root.remove(child)
-        return ET.tostring(root, encoding='utf-8', xml_declaration=True)
-    except Exception:
-        return ct_bytes
-
-
-# Patchers
-
 def _patch_sheet_xml(sheet_xml_bytes: bytes, header_row: int, start_row: int, used_cols_final: int, block_2d: list) -> bytes:
     root = ET.fromstring(sheet_xml_bytes)
     sheetData = root.find(f"{{{XL_NS_MAIN}}}sheetData")
     if sheetData is None:
         sheetData = ET.SubElement(root, f"{{{XL_NS_MAIN}}}sheetData")
 
-    # Remove existing rows at/after start_row
+    # Remove existing rows at/after start_row (keep headers intact)
     for row in list(sheetData):
         try:
             r = int(row.attrib.get("r", "0") or "0")
@@ -259,6 +146,7 @@ def _patch_sheet_xml(sheet_xml_bytes: bytes, header_row: int, start_row: int, us
         if r >= start_row:
             sheetData.remove(row)
 
+    # Append new rows with inline strings (sanitized) and row spans
     row_span = f"1:{used_cols_final}" if used_cols_final > 0 else "1:1"
     for i, row_vals in enumerate(block_2d):
         r = start_row + i
@@ -284,149 +172,147 @@ def _patch_sheet_xml(sheet_xml_bytes: bytes, header_row: int, start_row: int, us
         if any_val:
             sheetData.append(row_el)
 
-    # compute bounds
-    last_row = max(header_row, start_row + max(0, len(block_2d) - 1))
-    last_col_num = max(1, used_cols_final)
-
-    # clamp autoFilter
-    af = root.find(f"{{{XL_NS_MAIN}}}autoFilter")
-    if af is not None and af.attrib.get("ref"):
-        af.set("ref", _clamp_ref(af.attrib.get("ref"), last_col_num, last_row))
-
-    # clamp conditional formatting ranges
-    for cf in root.findall(f"{{{XL_NS_MAIN}}}conditionalFormatting"):
-        sq = cf.attrib.get("sqref")
-        if sq:
-            cf.set("sqref", _clamp_sqref_list(sq, last_col_num, last_row))
-
-    # clamp data validation sqref
-    dv_parent = root.find(f"{{{XL_NS_MAIN}}}dataValidations")
-    if dv_parent is not None:
-        for dv in dv_parent.findall(f"{{{XL_NS_MAIN}}}dataValidation"):
-            sq = dv.attrib.get("sqref")
-            if sq:
-                dv.set("sqref", _clamp_sqref_list(sq, last_col_num, last_row))
-
-    # clamp merged cells
-    merges = root.find(f"{{{XL_NS_MAIN}}}mergeCells")
-    if merges is not None:
-        for mc in list(merges):
-            ref = mc.attrib.get("ref")
-            m = RANGE_RE.match(ref or "")
-            if not m:
-                continue
-            c1, r1, c2, r2 = m.group(1), int(m.group(2)), m.group(3), int(m.group(4))
-            c1L, r1N, c2L, r2N = _clamp_coords(c1, r1, c2, r2, last_col_num, last_row)
-            mc.set("ref", f"{c1L}{r1N}:{c2L}{r2N}")
-
-    # update dimension
+    # Update dimension by unioning with original and ensuring it covers the table width
     dim = root.find(f"{{{XL_NS_MAIN}}}dimension")
     if dim is None:
         dim = ET.SubElement(root, f"{{{XL_NS_MAIN}}}dimension")
         dim.set("ref", "A1:A1")
-    dim.set("ref", _union_dimension(dim.attrib.get("ref", "A1:A1"), last_col_num, last_row))
+    last_row = start_row + max(0, len(block_2d) - 1)
+    new_ref = _union_dimension(dim.attrib.get("ref", "A1:A1"), used_cols_final, last_row)
+    dim.set("ref", new_ref)
 
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
 
-def _patch_table_xml(table_xml_bytes: bytes, header_row: int, last_row: int, start_col_letter: str, width_cols: int) -> bytes:
+def _patch_table_xml(table_xml_bytes: bytes, header_row: int, last_row: int, last_col_n: int) -> bytes:
     root = ET.fromstring(table_xml_bytes)
-    last_col_letter = _col_letter(_col_number(start_col_letter) + width_cols - 1)
-    new_ref = f"{start_col_letter}{header_row}:{last_col_letter}{last_row}"
+    new_ref = f"A{header_row}:{_col_letter(last_col_n)}{last_row}"
     root.set("ref", new_ref)
     af = root.find(f"{{{XL_NS_MAIN}}}autoFilter")
     if af is None:
         af = ET.SubElement(root, f"{{{XL_NS_MAIN}}}autoFilter")
     af.set("ref", new_ref)
+    # Keep tableColumns count but don't rewrite columns list (safer)
+    tcols = root.find(f"{{{XL_NS_MAIN}}}tableColumns")
+    if tcols is not None:
+        # Ensure count is at least current children and not less than our width
+        child_count = sum(1 for _ in tcols)
+        new_count = max(child_count, last_col_n)
+        tcols.set("count", str(new_count))
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
 
 def fast_patch_template(master_bytes: bytes, sheet_name: str, header_row: int, start_row: int, used_cols: int, block_2d: list) -> bytes:
+    """Return new workbook bytes with the Template sheet replaced by our bulk data and synced table ranges."""
     zin = zipfile.ZipFile(io.BytesIO(master_bytes), "r")
-
-    # locate sheet + tables
     sheet_path = _find_sheet_part_path(zin, sheet_name)
     table_paths = _get_table_paths_for_sheet(zin, sheet_path)
 
-    # compute final width (respect the smallest table width if present)
-    final_cols = max(1, used_cols)
-    table_infos = []
+    # Determine final width: respect existing table column counts if larger than header width
+    max_cols = used_cols
+    table_cols_counts = []
     for tp in table_paths:
         try:
-            sc, sr, width = _read_table_info(zin.read(tp))
-            table_infos.append((tp, sc, sr, width))
-            final_cols = min(final_cols, width)
+            cnt = _read_table_cols_count(zin.read(tp))
+            if cnt:
+                table_cols_counts.append(cnt)
+                if cnt > max_cols:
+                    max_cols = cnt
         except Exception:
             pass
 
-    # patch sheet
     original_sheet_xml = zin.read(sheet_path)
-    new_sheet_xml = _patch_sheet_xml(original_sheet_xml, header_row, start_row, final_cols, block_2d)
+    new_sheet_xml = _patch_sheet_xml(original_sheet_xml, header_row, start_row, max_cols, block_2d)
 
-    # patch all tables for the sheet
-    last_row = max(header_row, start_row + max(0, len(block_2d) - 1))
+    # Compute last row including data
+    last_row = start_row + max(0, len(block_2d) - 1)
+    if last_row < header_row:
+        last_row = header_row
+
+    # Prepare patched table xmls
     patched_tables = {}
-    for (tp, sc, sr, width) in table_infos:
+    for tp in table_paths:
         try:
-            patched_tables[tp] = _patch_table_xml(zin.read(tp), header_row, last_row, sc, width)
+            patched_tables[tp] = _patch_table_xml(zin.read(tp), header_row, last_row, max_cols)
         except Exception:
+            # If anything goes wrong, skip patching that table (Excel will still load)
             pass
 
-    # clamp defined names pointing to the sheet
-    workbook_xml = zin.read("xl/workbook.xml")
-    new_workbook_xml = _clamp_defined_names(workbook_xml, sheet_name, final_cols, last_row)
-
-    # repack: drop calcChain + strip its content-type entry
     out_bio = io.BytesIO()
     with zipfile.ZipFile(out_bio, "w", zipfile.ZIP_DEFLATED) as zout:
         for item in zin.infolist():
-            if item.filename == "xl/calcChain.xml":
-                continue
             data = zin.read(item.filename)
             if item.filename == sheet_path:
                 data = new_sheet_xml
             elif item.filename in patched_tables:
                 data = patched_tables[item.filename]
-            elif item.filename == "xl/workbook.xml":
-                data = new_workbook_xml
-            elif item.filename == "[Content_Types].xml":
-                data = _strip_calcchain_from_content_types(data)
             zout.writestr(item, data)
     zin.close()
     out_bio.seek(0)
     return out_bio.getvalue()
 
 # ─────────────────────────────────────────────────────────────────────
-# Page meta + theming
+# Page meta + theming (visuals only; core logic unchanged)
 # ─────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Masterfile Automation - Amazon", page_icon="🧾", layout="wide")
-
-st.markdown(
-    """
-<style>
-:root{--bg1:#f6f9fc;--bg2:#fff;--card:#fff;--card-border:#e8eef6;--ink:#0f172a;--muted:#64748b;--accent:#2563eb}
-.stApp{background:linear-gradient(180deg,var(--bg1) 0%,var(--bg2) 70%)}
-.block-container{padding-top:.75rem}
-.section{border:1px solid var(--card-border);background:var(--card);border-radius:16px;padding:18px 20px;box-shadow:0 6px 24px rgba(2,6,23,.05);margin-bottom:18px}
-h1,h2,h3{color:var(--ink)}hr{border-color:#eef2f7}
-.badge{display:inline-block;padding:4px 10px;border-radius:999px;font-size:.82rem;font-weight:600;letter-spacing:.2px;margin-right:.25rem}
-.badge-info{background:#eef2ff;color:#1e40af}.badge-ok{background:#ecfdf5;color:#065f46}.small-note{color:#64748b;font-size:.92rem}
-.stDownloadButton>button,div.stButton>button{background:var(--accent)!important;color:#fff!important;border-radius:10px!important;border:0!important;box-shadow:0 8px 18px rgba(37,99,235,.18)}
-</style>
-""",
-    unsafe_allow_html=True,
+st.set_page_config(
+    page_title="Masterfile Automation - Amazon",
+    page_icon="🧾",
+    layout="wide"
 )
 
-# ─────────────────────────────────────────────────────────────────────
-# Masterfile layout
-# ─────────────────────────────────────────────────────────────────────
-MASTER_TEMPLATE_SHEET = "Template"
-MASTER_DISPLAY_ROW    = 2
-MASTER_SECONDARY_ROW  = 3
-MASTER_DATA_START_ROW = 4
+# Polished theme
+st.markdown("""
+<style>
+:root{
+  --bg1:#f6f9fc; --bg2:#ffffff;
+  --card:#ffffff; --card-border:#e8eef6;
+  --ink:#0f172a; --muted:#64748b; --accent:#2563eb;
+  --badge-ok:#ecfdf5; --badge-ok-ink:#065f46;
+  --badge-warn:#fff7ed; --badge-warn-ink:#9a3412;
+  --badge-info:#eef2ff; --badge-info-ink:#1e40af;
+}
+.stApp { background: linear-gradient(180deg, var(--bg1) 0%, var(--bg2) 70%); }
+.block-container { padding-top: 0.75rem; }
+.section {
+  border: 1px solid var(--card-border);
+  background: var(--card);
+  border-radius: 16px;
+  padding: 18px 20px;
+  box-shadow: 0 6px 24px rgba(2, 6, 23, 0.05);
+  margin-bottom: 18px;
+}
+h1, h2, h3 { color: var(--ink); }
+hr { border-color: #eef2f7; }
+.badge {
+  display:inline-block;padding:4px 10px;border-radius:999px;
+  font-size:0.82rem;font-weight:600;letter-spacing:.2px;margin-right:.25rem
+}
+.badge-info { background:var(--badge-info); color:var(--badge-info-ink); }
+.badge-ok { background:var(--badge-ok); color:var(--badge-ok-ink); }
+.badge-warn { background:var(--badge-warn); color:var(--badge-warn-ink); }
+.small-note{ color:var(--muted); font-size:0.92rem; }
+div.stButton>button, .stDownloadButton>button {
+  background: var(--accent) !important; color:#fff !important;
+  border-radius: 10px !important; border:0 !important;
+  box-shadow: 0 8px 18px rgba(37,99,235,.18);
+}
+div.stButton>button:hover, .stDownloadButton>button:hover{ filter: brightness(0.95); }
+.stTextArea, .stFileUploader, .stTabs {
+  border-radius: 12px !important;
+}
+</style>
+""", unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────
-# Helpers for mapping
+# Masterfile layout (your template)
+# ─────────────────────────────────────────────────────────────────────
+MASTER_TEMPLATE_SHEET = "Template"   # write only here
+MASTER_DISPLAY_ROW    = 2            # mapping row in master (normal headers)
+MASTER_SECONDARY_ROW  = 3            # ONLY used to disambiguate bullet points
+MASTER_DATA_START_ROW = 4            # first data row in master
+
+# ─────────────────────────────────────────────────────────────────────
+# Helpers
 # ─────────────────────────────────────────────────────────────────────
 def norm(s: str) -> str:
     if s is None:
@@ -438,13 +324,11 @@ def norm(s: str) -> str:
     x = re.sub(r"[^0-9a-z\s]+", " ", x)
     return re.sub(r"\s+", " ", x).strip()
 
-
 def top_matches(query, candidates, k=3):
     q = norm(query)
     scored = [(SequenceMatcher(None, q, norm(c)).ratio(), c) for c in candidates]
     scored.sort(key=lambda t: t[0], reverse=True)
     return scored[:k]
-
 
 def worksheet_used_cols(ws, header_rows=(1,), hard_cap=2048, empty_streak_stop=8):
     max_try = min(ws.max_column, hard_cap)
@@ -459,12 +343,9 @@ def worksheet_used_cols(ws, header_rows=(1,), hard_cap=2048, empty_streak_stop=8
                 break
     return max(last_nonempty, 1)
 
-
 def nonempty_rows(df: pd.DataFrame) -> int:
-    if df.empty:
-        return 0
+    if df.empty: return 0
     return df.replace("", pd.NA).dropna(how="all").shape[0]
-
 
 def pick_best_onboarding_sheet(uploaded_file, mapping_aliases_by_master):
     uploaded_file.seek(0)
@@ -488,29 +369,34 @@ def pick_best_onboarding_sheet(uploaded_file, mapping_aliases_by_master):
         raise ValueError("No readable onboarding sheet found.")
     return best[0], best[1], best_info
 
-
 SENTINEL_LIST = object()
 
 # ─────────────────────────────────────────────────────────────────────
-# UI
+# Header + main controls (top)
 # ─────────────────────────────────────────────────────────────────────
 st.title("🧾 Masterfile Automation – Amazon")
-st.caption("Fills only the Template sheet and preserves all other sheets/styles.")
+st.caption("Fills **only** the Template sheet and preserves all other sheets/styles.")
 
-st.markdown("<div class='section'><span class='badge badge-info'>Template-only writer</span> <span class='badge badge-ok'>Linux-fast XML patch</span></div>", unsafe_allow_html=True)
+st.markdown(
+    f"<div class='section'><span class='badge badge-info'>Template-only writer</span>"
+    f" <span class='badge badge-ok'>Linux-fast XML patch</span></div>",
+    unsafe_allow_html=True
+)
 
+# Upload + Mapping inputs
 st.markdown("<div class='section'>", unsafe_allow_html=True)
 c1, c2 = st.columns([1, 1])
 with c1:
     masterfile_file = st.file_uploader("📄 Masterfile Template (.xlsx / .xlsm)", type=["xlsx", "xlsm"])
 with c2:
-    onboarding_file = st.file_uploader("🧾 Onboarding (.xlsx)", type=["xlsx"]) 
+    onboarding_file = st.file_uploader("🧾 Onboarding (.xlsx)", type=["xlsx"])
 
 st.markdown("#### 🔗 Mapping JSON")
 tab1, tab2 = st.tabs(["Paste JSON", "Upload JSON"])
 mapping_json_text, mapping_json_file = "", None
 with tab1:
-    mapping_json_text = st.text_area("Paste mapping JSON", height=200, placeholder='\n{\n  "Partner SKU": ["Seller SKU", "item_sku"]\n}\n')
+    mapping_json_text = st.text_area("Paste mapping JSON", height=200,
+                                     placeholder='\n{\n  "Partner SKU": ["Seller SKU", "item_sku"]\n}\n')
 with tab2:
     mapping_json_file = st.file_uploader("Or upload mapping.json", type=["json"], key="mapping_file")
 
@@ -523,19 +409,23 @@ go = st.button("🚀 Generate Final Masterfile", type="primary")
 # Main
 # ─────────────────────────────────────────────────────────────────────
 if go:
+    # Log area
     st.markdown("<div class='section'>", unsafe_allow_html=True)
     st.markdown("### 📝 Log")
     log = st.empty()
     def slog(msg): log.markdown(msg)
 
     if not masterfile_file or not onboarding_file:
-        st.error("Please upload both Masterfile Template and Onboarding.")
+        st.error("Please upload both **Masterfile Template** and **Onboarding**.")
         st.markdown("</div>", unsafe_allow_html=True)
         st.stop()
 
+    # Remember original extension to preserve (.xlsx/.xlsm)
     ext = (Path(masterfile_file.name).suffix or ".xlsx").lower()
-    mime_map = {".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", 
-                ".xlsm": "application/vnd.ms-excel.sheet.macroEnabled.12"}
+    mime_map = {
+        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".xlsm": "application/vnd.ms-excel.sheet.macroEnabled.12",
+    }
     out_mime = mime_map.get(ext, mime_map[".xlsx"])
 
     # Parse mapping JSON
@@ -546,10 +436,11 @@ if go:
         st.markdown("</div>", unsafe_allow_html=True)
         st.stop()
     if not isinstance(mapping_raw, dict):
-        st.error("Mapping JSON must be an object: {\"Master header\": [aliases...]}")
+        st.error("Mapping JSON must be an object: {\"Master header\": [aliases...]}.")
         st.markdown("</div>", unsafe_allow_html=True)
         st.stop()
 
+    # Normalize mapping { master_norm: [alias1, alias2, ..., fallback master display] }
     mapping_aliases = {}
     for k, v in mapping_raw.items():
         aliases = v[:] if isinstance(v, list) else [v]
@@ -557,6 +448,7 @@ if go:
             aliases.append(k)
         mapping_aliases[norm(k)] = aliases
 
+    # Read Template headers quickly
     masterfile_file.seek(0)
     master_bytes = masterfile_file.read()
 
@@ -564,7 +456,7 @@ if go:
     t0 = time.time()
     wb_ro = load_workbook(io.BytesIO(master_bytes), read_only=True, data_only=True, keep_links=True)
     if MASTER_TEMPLATE_SHEET not in wb_ro.sheetnames:
-        st.error(f"Sheet '{MASTER_TEMPLATE_SHEET}' not found in masterfile.")
+        st.error(f"Sheet **'{MASTER_TEMPLATE_SHEET}'** not found in the masterfile.")
         st.markdown("</div>", unsafe_allow_html=True)
         st.stop()
     ws_ro = wb_ro[MASTER_TEMPLATE_SHEET]
@@ -574,6 +466,7 @@ if go:
     wb_ro.close()
     slog(f"✅ Template headers loaded (cols={used_cols}) in {time.time()-t0:.2f}s")
 
+    # Pick best onboarding sheet
     try:
         best_df, best_sheet, info = pick_best_onboarding_sheet(onboarding_file, mapping_aliases)
     except Exception as e:
@@ -585,8 +478,9 @@ if go:
     on_headers = list(on_df.columns)
     st.success(f"Using onboarding sheet: **{best_sheet}** ({info})")
 
+    # Build mapping: master col -> source Series (or SENTINEL_LIST)
     series_by_alias = {norm(h): on_df[h] for h in on_headers}
-    master_to_source, report_lines = {}, []
+    master_to_source, report_lines, unmatched = {}, [], []
     report_lines.append("#### 🔎 Mapping Summary (Template)")
 
     BULLET_DISP_N = norm("Key Product Features")
@@ -595,7 +489,7 @@ if go:
         disp_norm = norm(disp)
         sec_norm  = norm(sec)
         if disp_norm == BULLET_DISP_N and sec_norm:
-            effective_header = sec
+            effective_header = sec  # e.g., 'bullet_point1'
             label_for_log = f"{disp} ({sec})"
         else:
             effective_header = disp
@@ -606,6 +500,7 @@ if go:
             continue
 
         aliases = mapping_aliases.get(eff_norm, [effective_header])
+
         resolved = None
         for a in aliases:
             s = series_by_alias.get(norm(a))
@@ -619,16 +514,18 @@ if go:
         else:
             if disp_norm == norm("Listing Action (List or Unlist)"):
                 master_to_source[c] = SENTINEL_LIST
-                report_lines.append(f"- 🟨 **{label_for_log}** ← (will fill 'List')")
+                report_lines.append(f"- 🟨 **{label_for_log}** ← (will fill `'List'`)")
             else:
+                unmatched.append(label_for_log or f"Col {c}")
                 sugg = top_matches(effective_header, on_headers, 3)
                 sug_txt = ", ".join(f"`{name}` ({round(sc*100,1)}%)" for sc, name in sugg) if sugg else "*none*"
-                report_lines.append(f"- ❌ **{label_for_log}** ← no match. Suggestions: {sug_txt}")
+                report_lines.append(f"- ❌ **{label_for_log}** ← *no match*. Suggestions: {sug_txt}")
 
     st.markdown("\n".join(report_lines))
 
     n_rows = len(on_df)
 
+    # Build a 2D block once for fast writer
     block = [[""] * used_cols for _ in range(n_rows)]
     for col, src in master_to_source.items():
         if src is SENTINEL_LIST:
@@ -642,8 +539,12 @@ if go:
                 if v and v.lower() not in ("nan", "none", ""):
                     block[i][col-1] = v
 
-    slog("🚀 Writing via Linux-fast XML (tables+names+CF/DV/merges + drop calcChain)…")
+    # ─────────────────────────────────────────────────────────────
+    # Writer: Linux-fast XML patch (only) + table sync
+    # ─────────────────────────────────────────────────────────────
+    slog("🚀 Using Linux-fast XML writer (with table sync)…")
     t_write = time.time()
+
     out_bytes = fast_patch_template(
         master_bytes=master_bytes,
         sheet_name=MASTER_TEMPLATE_SHEET,
@@ -653,18 +554,44 @@ if go:
         block_2d=block
     )
 
-    slog(f"✅ Wrote in {time.time()-t_write:.2f}s")
-    st.download_button("⬇️ Download Final Masterfile", data=out_bytes, file_name=f"final_masterfile{ext}", mime=out_mime, key="dl_xmlfast")
+    slog(f"✅ Wrote & saved via XML patch in {time.time()-t_write:.2f}s")
+    st.download_button(
+        "⬇️ Download Final Masterfile",
+        data=out_bytes,
+        file_name=f"final_masterfile{ext}",
+        mime=out_mime,
+        key="dl_xmlfast",
+    )
 
     st.markdown("</div>", unsafe_allow_html=True)
 
-with st.expander("📘 How to use", expanded=False):
+# ─────────────────────────────────────────────────────────────────────
+# Friendly Instructions (bottom)
+# ─────────────────────────────────────────────────────────────────────
+with st.expander("📘 How to use (step-by-step)", expanded=False):
     st.markdown(dedent(f"""
-    - Writes only into `{MASTER_TEMPLATE_SHEET}`; preserves other tabs, styles, formulas, macros.
-    - Headers are in row {MASTER_DISPLAY_ROW}; data starts at row {MASTER_DATA_START_ROW}.
-    - Table ranges, autoFilter, Conditional Formatting, Data Validations, and merged cells are auto-synced.
-    - Defined Names pointing to the sheet are clamped; `calcChain.xml` is removed so Excel rebuilds silently.
-    - Invalid control characters are removed automatically.
+    **What this tool does**
+    - It only writes data into the **`{MASTER_TEMPLATE_SHEET}`** sheet of your Masterfile.
+    - All other tabs, formulas and formatting stay the same.
+    - For **Key Product Features**, we read the small labels in **Row {MASTER_SECONDARY_ROW}** (like `bullet_point1..5`).
+      For everything else, we use the column names in **Row {MASTER_DISPLAY_ROW}``.
+    - Your product rows start from **Row {MASTER_DATA_START_ROW}**.
+
+    **How to run**
+    1. Upload the **Masterfile** (.xlsx / .xlsm) and the **Onboarding** (.xlsx) files above.
+    2. Paste or upload the **Mapping JSON**.
+    3. Click **Generate Final Masterfile** to download the filled sheet (Linux-fast).
+
+    **Notes**
+    - Invalid XML control characters in inputs are auto-removed to prevent Excel repair prompts.
+    - Table ranges (and autofilter) are automatically synchronized to the new size to avoid repair dialogs.
     """))
 
-st.markdown("<div class='section small-note'>Optimized for Streamlit Cloud (Linux).</div>", unsafe_allow_html=True)
+st.markdown(
+    "<div class='section small-note'>"
+    "On Streamlit Cloud (Linux), the app uses the Linux-fast XML path and preserves macros/styles."
+    "</div>",
+    unsafe_allow_html=True
+)
+
+
