@@ -19,7 +19,7 @@ XL_NS_REL  = "http://schemas.openxmlformats.org/officeDocument/2006/relationship
 ET.register_namespace("", XL_NS_MAIN)
 ET.register_namespace("r", XL_NS_REL)
 ET.register_namespace("mc", "http://schemas.openxmlformats.org/markup-compatibility/2006")
-# DO NOT register x14ac or write x14ac:dyDescent on <row> (causes “file is corrupt” on many templates)
+# DO NOT register x14ac and DO NOT write x14ac:dyDescent on <row>
 
 _INVALID_XML_CHARS = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\uD800-\uDFFF]")
 CELL_RE  = re.compile(r"^([A-Z]+)(\d+)$")
@@ -290,11 +290,10 @@ def _patch_sheet_xml(sheet_xml_bytes: bytes, header_row: int, start_row: int, us
                     m = CELL_RE.match(ac)
                     if m:
                         c, r = m.group(1), int(m.group(2))
-                        c1L, r1N, c2L, r2N = _clamp_coords(c, r, c, r, last_col_num, last_row)
+                        c1L, r1N, _, _ = _clamp_coords(c, r, c, r, last_col_num, last_row)
                         sel.set("activeCell", f"{c1L}{r1N}")
                 sq = sel.attrib.get("sqref")
                 if sq:
-                    # sqref can be a space-separated list of ranges; clamp each
                     sel.set("sqref", _clamp_sqref_list(sq, last_col_num, last_row))
 
     # dimension
@@ -636,9 +635,7 @@ if go:
 with st.expander("📘 How to use", expanded=False):
     st.markdown(dedent(f"""
     - Writes only into `{MASTER_TEMPLATE_SHEET}`; preserves other tabs, styles, formulas, macros.
-    - Table ranges, AutoFilter, Conditional Formatting, Data Validations, merged cells, and sheet selections are auto-synced.
-    - Defined Names pointing to the sheet are clamped; `calcChain.xml` is removed so Excel rebuilds silently.
+    - Table ranges, AutoFilter, Conditional Formatting, Data Validations, merged cells, sheet selection, and Defined Names are auto-synced.
+    - Deletes `calcChain.xml` so Excel rebuilds silently. No repair prompts.
     - Invalid control characters are removed automatically.
     """))
-
-st.markdown("<div class='section small-note'>Optimized for Streamlit Cloud (Linux).</div>", unsafe_allow_html=True)
