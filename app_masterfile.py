@@ -46,7 +46,7 @@ XL_NS_REL  = "http://schemas.openxmlformats.org/officeDocument/2006/relationship
 ET.register_namespace("", XL_NS_MAIN)
 ET.register_namespace("r", XL_NS_REL)
 ET.register_namespace("mc", "http://schemas.openxmlformats.org/markup-compatibility/2006")
-ET.register_namespace("x14ac", "http://schemas.microsoft.com/office/spreadsheet/2009/9/ac")
+ET.register_namespace("x14ac", "http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac")
 
 _INVALID_XML_CHARS = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\uD800-\uDFFF]")
 
@@ -98,7 +98,7 @@ def _col_number(letters: str) -> int:
         n = n * 26 + (ord(ch.upper()) - 64)
     return n
 
-# --- Helper to sanitize output filename (keeps letters, numbers, space, _ . - ) ---
+# NEW: safe output filename (keeps letters, numbers, space, _ . -)
 def safe_filename(name: str, fallback: str = "final_masterfile") -> str:
     if name is None:
         return fallback
