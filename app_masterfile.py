@@ -39,6 +39,60 @@ MASTER_SECONDARY_ROW  = 3            # bullet disambiguators
 MASTER_DATA_START_ROW = 4            # first data row
 
 # ─────────────────────────────────────────────────────────────────────
+# Pre-defined attribute mappings
+# ─────────────────────────────────────────────────────────────────────
+PREDEFINED_MAPPING = {
+    "Product Type": ["Amazon Product Type"],
+    "Seller SKU": ["Pattern SKU", "Seller SKU", "item_sku", "SKU"],
+    "Product ID": ["UPC", "UPC/EAN", "Product ID", "external_product_id", "barcode", "barcode.value"],
+    "Brand Name": ["Brand Name", "Brand", "brand_name", "Walmart Brand Name - en-US"],
+    "Product ID Type": ["Product ID Type"],
+    "Item Type Keyword": ["Amazon Category (Tree)"],
+    "Your Price": ["List Price", "Selling Price"],
+    "Manufacturer": ["Manufacturer Name", "Manufacturer Name (for enforcement)", "Manufacturer"],
+    "Manufacturer Part Number": ["Manufacturer Part Number"],
+    "Description": ["Product Description", "Description", "long_description", "Walmart Description - en-US"],
+    "Main Image URL": ["Main Image", "Main Image URL", "main image url", "image url", "Walmart Main Image URL - en-US", "main_image_url - en-US"],
+    "Package Length": ["Package Length (IN)", "Packaged Length (IN)", "Package Length", "package_length - en-US", "length", "depth"],
+    "Package Height": ["Package Height (IN)", "Packaged Height (IN)", "Package Height", "package_height - en-US", "height"],
+    "Package Weight": ["Package Weight (LB)", "Packaged Weight (LB)", "Package Weight", "package_weight - en-US", "weight"],
+    "Package Width": ["Package Width (IN)", "Packaged Width (IN)", "Package Width", "package_width - en-US", "width"],
+    "Product Name": ["Product Name", "item_name", "Item Name", "Walmart Title - en-US", "Title"],
+    "Item Length": ["Item Length (IN)", "Item Length", "item_length - en-US", "length", "depth"],
+    "Item Height": ["Item Height (IN)", "Item Height", "item_height - en-US", "height"],
+    "Item Weight": ["Item Weight (LB)", "Item Weight", "item_weight - en-US", "weight"],
+    "Item Width": ["Item Width (IN)", "Item Width", "item_width - en-US", "width"],
+    "Unit Count": ["Measurement Value"],
+    "Ingredients": ["Ingredients"],
+    "Country of Origin": ["Country of Origin"],
+    "Variation Theme": ["Variation Theme"],
+    "Directions": ["Directions"],
+    "Indications": ["Indications"],
+    "Is the Item Heat Sensitive?": ["Is the item heat sensitive? (Y/N)"],
+    "List Price": ["List Price", "Selling Price"],
+    "Item Form": ["Item Form (Capsule, Softgel, Powder, Tablet, etc)"],
+    "Is Product Expirable": ["Able to Expire? (Y/N)"],
+    "Fulfillment Center Shelf Life": ["Shelf Life"],
+    "Product Expiration Type": ["Shelf Life"],
+    "currency": ["List Price Currency Type (USD, EUR, CAD, etc)"],
+    "safety_data_sheet_url": ["SDS Sheet"],
+    "Other Image URL1": ["Additional Image 1", "Other Image URL1", "Other Image URL 1", "Image 1", "Walmart Additional Image URL #2 - en-US"],
+    "Other Image URL2": ["Additional Image 2", "Other Image URL2", "Other Image URL 2", "Image 2", "Walmart Additional Image URL #3 - en-US"],
+    "Other Image URL3": ["Additional Image 3", "Other Image URL3", "Other Image URL 3", "Image 3", "Walmart Additional Image URL #4 - en-US"],
+    "Other Image URL4": ["Additional Image 4", "Other Image URL4", "Other Image URL 4", "Image 4", "Walmart Additional Image URL #5 - en-US"],
+    "Other Image URL5": ["Additional Image 5", "Other Image URL5", "Other Image URL 5", "Image 5", "Walmart Additional Image URL #6 - en-US"],
+    "Other Image URL6": ["Additional Image 6", "Other Image URL6", "Other Image URL 6", "Image 6", "Walmart Additional Image URL #7 - en-US"],
+    "Other Image URL7": ["Additional Image 7", "Other Image URL7", "Other Image URL 7", "Image 7", "Walmart Additional Image URL #8 - en-US"],
+    "Other Image URL8": ["Additional Image 8", "Other Image URL8", "Other Image URL 8", "Image 8", "Walmart Additional Image URL #9 - en-US"],
+    "Other Image URL9": ["Additional Image 9", "Other Image URL9", "Other Image URL 9", "Image 9", "Walmart Additional Image URL #10 - en-US"],
+    "bullet_point1": ["Bullet point 1", "bullet_point1", "Bullet Feature 1", "bullet point 1", "bullet_point1 - en-US", "Key Features #1 - en-US"],
+    "bullet_point2": ["Bullet point 2", "bullet_point2", "Bullet Feature 2", "bullet point 2", "bullet_point2 - en-US", "Key Features #2 - en-US"],
+    "bullet_point3": ["Bullet point 3", "bullet_point3", "Bullet Feature 3", "bullet point 3", "bullet_point3 - en-US", "Key Features #3 - en-US"],
+    "bullet_point4": ["Bullet point 4", "bullet_point4", "Bullet Feature 4", "bullet point 4", "bullet_point4 - en-US", "Key Features #4 - en-US"],
+    "bullet_point5": ["Bullet point 5", "bullet_point5", "Bullet Feature 5", "bullet point 5", "bullet_point5 - en-US", "Key Features #5 - en-US"]
+}
+
+# ─────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────
 XL_NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -74,7 +128,8 @@ def nonempty_rows(df: pd.DataFrame) -> int:
     return df.replace("", pd.NA).dropna(how="all").shape[0]
 
 def worksheet_used_cols(ws, header_rows=(1,), hard_cap=2048, empty_streak_stop=8):
-    max_try = min(ws.max_column, hard_cap)
+    max_col = ws.max_column if ws.max_column is not None else 1
+    max_try = min(max_col, hard_cap)
     last_nonempty, streak = 0, 0
     for c in range(1, max_try + 1):
         any_val = any((ws.cell(row=r, column=c).value not in (None, "")) for r in header_rows)
@@ -325,215 +380,325 @@ def fast_patch_template(master_bytes: bytes, sheet_name: str, header_row: int, s
     return out_bio.getvalue()
 
 # ─────────────────────────────────────────────────────────────────────
+# Session state initialization
+# ─────────────────────────────────────────────────────────────────────
+if 'unmapped_attributes' not in st.session_state:
+    st.session_state.unmapped_attributes = []
+if 'user_mappings' not in st.session_state:
+    st.session_state.user_mappings = {}
+if 'master_data' not in st.session_state:
+    st.session_state.master_data = {}
+if 'onboarding_data' not in st.session_state:
+    st.session_state.onboarding_data = {}
+if 'last_files' not in st.session_state:
+    st.session_state.last_files = (None, None)
+
+# ─────────────────────────────────────────────────────────────────────
 # UI — inputs
 # ─────────────────────────────────────────────────────────────────────
 st.title("🧾 Masterfile Automation – Amazon")
-st.caption("Ultra-fast writer (seconds). Preserves all sheets, styles, formulas, and macros (.xlsm).")
+st.caption("Ultra-fast writer with smart pre-configured mappings. Just upload files and map any remaining attributes!")
 
-st.markdown("<div class='section'><span class='badge badge-info'>Template-only writer</span> "
-            "<span class='badge badge-ok'>Fast XML, no fallbacks</span></div>", unsafe_allow_html=True)
+st.markdown("<div class='section'><span class='badge badge-info'>Pre-configured Mappings</span> "
+            "<span class='badge badge-ok'>Fast XML Writer</span></div>", unsafe_allow_html=True)
 
 st.markdown("<div class='section'>", unsafe_allow_html=True)
 c1, c2 = st.columns([1, 1])
 with c1:
-    # Accepts ANY filename; no naming restriction applied
-    masterfile_file = st.file_uploader("📄 Masterfile Template (.xlsx / .xlsm)", type=["xlsx", "xlsm"])
+    masterfile_file = st.file_uploader("📄 Masterfile Template (.xlsx / .xlsm)", type=["xlsx", "xlsm"], key="master_upload")
 with c2:
-    onboarding_file = st.file_uploader("🧾 Onboarding (.xlsx)", type=["xlsx"])
-
-st.markdown("#### 🔗 Mapping JSON")
-tab1, tab2 = st.tabs(["Paste JSON", "Upload JSON"])
-mapping_json_text, mapping_json_file = "", None
-with tab1:
-    mapping_json_text = st.text_area("Paste mapping JSON", height=200,
-                                     placeholder='\n{\n  "Partner SKU": ["Seller SKU", "item_sku"]\n}\n')
-with tab2:
-    mapping_json_file = st.file_uploader("Or upload mapping.json", type=["json"], key="mapping_file")
-
-# NEW: custom output filename (without extension)
-st.markdown("#### 📝 Final file name")
-final_name_input = st.text_input(
-    "Type the name you want for the final masterfile (without extension)",
-    value="final_masterfile",
-    help="We'll add .xlsx or .xlsm automatically based on your template."
-)
+    onboarding_file = st.file_uploader("🧾 Onboarding (.xlsx)", type=["xlsx"], key="onboard_upload")
 
 st.markdown("</div>", unsafe_allow_html=True)
 
-st.divider()
-go = st.button("🚀 Generate Final Masterfile", type="primary")
-
 # ─────────────────────────────────────────────────────────────────────
-# Main
+# Main — Automatic Analysis & Interactive Mapping
 # ─────────────────────────────────────────────────────────────────────
 SENTINEL_LIST = object()
 
-if go:
-    st.markdown("<div class='section'>", unsafe_allow_html=True)
-    st.markdown("### 📝 Log")
-    log = st.empty()
-    def slog(msg): log.markdown(msg)
-
-    if not masterfile_file or not onboarding_file:
-        st.error("Please upload both **Masterfile Template** and **Onboarding**.")
-        st.markdown("</div>", unsafe_allow_html=True)
-        st.stop()
-
-    # extension & mime (works with any uploaded name)
-    ext = (Path(masterfile_file.name).suffix or ".xlsx").lower()
-    mime_map = {
-        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        ".xlsm": "application/vnd.ms-excel.sheet.macroEnabled.12",
-    }
-    out_mime = mime_map.get(ext, mime_map[".xlsx"])
-
-    # Parse mapping JSON
-    try:
-        mapping_raw = json.loads(mapping_json_text) if mapping_json_text.strip() else json.load(mapping_json_file)
-    except Exception as e:
-        st.error(f"Mapping JSON parse error: {e}")
-        st.markdown("</div>", unsafe_allow_html=True)
-        st.stop()
-    if not isinstance(mapping_raw, dict):
-        st.error("Mapping JSON must be an object: {\"Master header\": [aliases...]}.")
-        st.markdown("</div>", unsafe_allow_html=True)
-        st.stop()
-
-    # Normalize mapping: { master_norm: [aliases...] }
+if masterfile_file and onboarding_file:
+    # Check if files changed - reset if so
+    current_files = (masterfile_file.name, onboarding_file.name)
+    if current_files != st.session_state.last_files:
+        st.session_state.last_files = current_files
+        st.session_state.master_data = {}
+        st.session_state.onboarding_data = {}
+        st.session_state.unmapped_attributes = []
+        st.session_state.user_mappings = {}
+    
+    # Use pre-defined mapping
     mapping_aliases = {}
-    for k, v in mapping_raw.items():
+    for k, v in PREDEFINED_MAPPING.items():
         aliases = v[:] if isinstance(v, list) else [v]
         if k not in aliases: aliases.append(k)
         mapping_aliases[norm(k)] = aliases
 
-    # Read template headers fast (read-only)
-    masterfile_file.seek(0)
-    master_bytes = masterfile_file.read()
+    # Read files if not already done
+    if not st.session_state.master_data:
+        with st.spinner("⏳ Analyzing files..."):
+            # Read template
+            masterfile_file.seek(0)
+            master_bytes = masterfile_file.read()
+            wb_ro = load_workbook(io.BytesIO(master_bytes), read_only=True, data_only=True, keep_links=True)
+            if MASTER_TEMPLATE_SHEET not in wb_ro.sheetnames:
+                st.error(f"Sheet **'{MASTER_TEMPLATE_SHEET}'** not found in the masterfile.")
+                st.stop()
+            ws_ro = wb_ro[MASTER_TEMPLATE_SHEET]
+            used_cols = worksheet_used_cols(ws_ro, header_rows=(MASTER_DISPLAY_ROW, MASTER_SECONDARY_ROW), hard_cap=2048, empty_streak_stop=8)
+            display_headers = [ws_ro.cell(row=MASTER_DISPLAY_ROW, column=c).value or "" for c in range(1, used_cols+1)]
+            secondary_headers = [ws_ro.cell(row=MASTER_SECONDARY_ROW, column=c).value or "" for c in range(1, used_cols+1)]
+            wb_ro.close()
 
-    slog("⏳ Reading Template headers…")
-    t0 = time.time()
-    wb_ro = load_workbook(io.BytesIO(master_bytes), read_only=True, data_only=True, keep_links=True)
-    if MASTER_TEMPLATE_SHEET not in wb_ro.sheetnames:
-        st.error(f"Sheet **'{MASTER_TEMPLATE_SHEET}'** not found in the masterfile."); st.stop()
-    ws_ro = wb_ro[MASTER_TEMPLATE_SHEET]
-    used_cols = worksheet_used_cols(ws_ro, header_rows=(MASTER_DISPLAY_ROW, MASTER_SECONDARY_ROW), hard_cap=2048, empty_streak_stop=8)
-    display_headers   = [ws_ro.cell(row=MASTER_DISPLAY_ROW,   column=c).value or "" for c in range(1, used_cols+1)]
-    secondary_headers = [ws_ro.cell(row=MASTER_SECONDARY_ROW, column=c).value or "" for c in range(1, used_cols+1)]
-    wb_ro.close()
-    slog(f"✅ Headers loaded (cols={used_cols}) in {time.time()-t0:.2f}s")
+            # Pick best onboarding sheet
+            best_xl = pd.ExcelFile(onboarding_file)
+            best, best_score, best_info = None, -1, ""
+            for sheet in best_xl.sheet_names:
+                try:
+                    df = best_xl.parse(sheet_name=sheet, header=0, dtype=str).fillna("")
+                    df.columns = [str(c).strip() for c in df.columns]
+                except Exception:
+                    continue
+                header_set = {norm(c) for c in df.columns}
+                matches = sum(any(norm(a) in header_set for a in aliases)
+                              for aliases in mapping_aliases.values())
+                rows = nonempty_rows(df)
+                score = matches + (0.01 if rows > 0 else 0.0)
+                if score > best_score:
+                    best, best_score = (df, sheet), score
+                    best_info = f"matched headers: {matches}, non-empty rows: {rows}"
+            if best is None:
+                st.error("No readable onboarding sheet found.")
+                st.stop()
+            best_df, best_sheet = best[0], best[1]
+            on_df = best_df.fillna("")
+            on_df.columns = [str(c).strip() for c in on_df.columns]
+            on_headers = list(on_df.columns)
 
-    # Pick best onboarding sheet
-    try:
-        best_xl = pd.ExcelFile(onboarding_file)
-        best, best_score, best_info = None, -1, ""
-        for sheet in best_xl.sheet_names:
-            try:
-                df = best_xl.parse(sheet_name=sheet, header=0, dtype=str).fillna("")
-                df.columns = [str(c).strip() for c in df.columns]
-            except Exception:
-                continue
-            header_set = {norm(c) for c in df.columns}
-            matches = sum(any(norm(a) in header_set for a in aliases)
-                          for aliases in mapping_aliases.values())
-            rows = nonempty_rows(df)
-            score = matches + (0.01 if rows > 0 else 0.0)
-            if score > best_score:
-                best, best_score = (df, sheet), score
-                best_info = f"matched headers: {matches}, non-empty rows: {rows}"
-        if best is None:
-            raise ValueError("No readable onboarding sheet found.")
-        best_df, best_sheet, info = best[0], best[1], best_info
-    except Exception as e:
-        st.error(f"Onboarding error: {e}"); st.stop()
+            # Analyze mappings
+            series_by_alias = {norm(h): on_df[h] for h in on_headers}
+            BULLET_DISP_N = norm("Key Product Features")
+            unmapped = []
+            mapped_count = 0
+            
+            # Get list of predefined attribute names (normalized)
+            predefined_norms = {norm(k) for k in PREDEFINED_MAPPING.keys()}
 
-    on_df = best_df.fillna("")
-    on_df.columns = [str(c).strip() for c in on_df.columns]
-    on_headers = list(on_df.columns)
-    st.success(f"Using onboarding sheet: **{best_sheet}** ({info})")
+            for c, (disp, sec) in enumerate(zip(display_headers, secondary_headers), start=1):
+                disp_norm = norm(disp)
+                sec_norm = norm(sec)
+                if disp_norm == BULLET_DISP_N and sec_norm:
+                    effective_header = sec
+                    label_for_log = f"{disp} ({sec})"
+                else:
+                    effective_header = disp
+                    label_for_log = disp
+                eff_norm = norm(effective_header)
+                if not eff_norm:
+                    continue
+                
+                # Check if this attribute is in predefined mappings
+                is_predefined = eff_norm in predefined_norms
+                
+                aliases = mapping_aliases.get(eff_norm, [effective_header])
+                resolved = None
+                for a in aliases:
+                    s = series_by_alias.get(norm(a))
+                    if s is not None:
+                        resolved = (s, a)
+                        break
+                
+                if resolved is None and disp_norm != norm("Listing Action (List or Unlist)"):
+                    # Only add to unmapped list if it's a predefined attribute
+                    if is_predefined:
+                        suggestions = top_matches(effective_header, on_headers, 3)
+                        unmapped.append({
+                            'col_num': c,
+                            'master_name': label_for_log,
+                            'display': disp,
+                            'secondary': sec,
+                            'suggestions': suggestions
+                        })
+                
+                if resolved is not None or disp_norm == norm("Listing Action (List or Unlist)"):
+                    mapped_count += 1
 
-    # Build mapping master col -> source series
-    series_by_alias = {norm(h): on_df[h] for h in on_headers}
-    report_lines = ["#### 🔎 Mapping Summary (Template)"]
-    BULLET_DISP_N = norm("Key Product Features")
-    master_to_source = {}
+            # Store in session state
+            st.session_state.master_data = {
+                'bytes': master_bytes,
+                'used_cols': used_cols,
+                'display_headers': display_headers,
+                'secondary_headers': secondary_headers,
+                'ext': (Path(masterfile_file.name).suffix or ".xlsx").lower()
+            }
+            st.session_state.onboarding_data = {
+                'df': on_df,
+                'headers': on_headers,
+                'series_by_alias': series_by_alias,
+                'best_sheet': best_sheet
+            }
+            st.session_state.unmapped_attributes = unmapped
+            st.session_state.mapped_count = mapped_count
 
-    for c, (disp, sec) in enumerate(zip(display_headers, secondary_headers), start=1):
-        disp_norm = norm(disp); sec_norm = norm(sec)
-        if disp_norm == BULLET_DISP_N and sec_norm:
-            effective_header = sec; label_for_log = f"{disp} ({sec})"
-        else:
-            effective_header = disp; label_for_log = disp
-        eff_norm = norm(effective_header)
-        if not eff_norm: continue
-        aliases = mapping_aliases.get(eff_norm, [effective_header])
-        resolved = None
-        for a in aliases:
-            s = series_by_alias.get(norm(a))
-            if s is not None:
-                resolved = s; break
-        if resolved is not None:
-            master_to_source[c] = resolved
-            report_lines.append(f"- ✅ **{label_for_log}** ← `{a}`")
-        else:
-            if disp_norm == norm("Listing Action (List or Unlist)"):
-                master_to_source[c] = SENTINEL_LIST
-                report_lines.append(f"- 🟨 **{label_for_log}** ← (will fill `'List'`)")
-            else:
-                sugg = top_matches(effective_header, on_headers, 3)
-                sug_txt = ", ".join(f"`{name}` ({round(sc*100,1)}%)" for sc, name in sugg) if sugg else "*none*"
-                report_lines.append(f"- ❌ **{label_for_log}** ← *no match*. Suggestions: {sug_txt}")
-    st.markdown("\n".join(report_lines))
-
-    n_rows = len(on_df)
-
-    # Build sanitized 2-D block (dense writer will emit all columns)
-    block = [[""] * used_cols for _ in range(n_rows)]
-    for col, src in master_to_source.items():
-        if src is SENTINEL_LIST:
-            for i in range(n_rows): block[i][col-1] = "List"
-        else:
-            vals = src.astype(str).tolist()
-            m = min(len(vals), n_rows)
-            for i in range(m):
-                v = sanitize_xml_text(vals[i].strip())
-                if v and v.lower() not in ("nan", "none", ""):
-                    block[i][col-1] = v
-
-    # FAST XML write (no fallback)
-    slog("🚀 Writing via fast XML…")
-    t_write = time.time()
-    out_bytes = fast_patch_template(
-        master_bytes=master_bytes,
-        sheet_name=MASTER_TEMPLATE_SHEET,
-        header_row=MASTER_DISPLAY_ROW,
-        start_row=MASTER_DATA_START_ROW,
-        used_cols=used_cols,
-        block_2d=block
-    )
-    slog(f"✅ Done in {time.time()-t_write:.2f}s")
-
-    # Download — use the chosen base name + template extension
-    final_base = safe_filename(final_name_input, fallback="final_masterfile")
-    final_filename = f"{final_base}{ext}"
-
-    st.download_button(
-        "⬇️ Download Final Masterfile",
-        data=out_bytes,
-        file_name=final_filename,
-        mime=out_mime,
-        key="dl_final_fast",
-    )
+    # Show mapping status
+    st.markdown("<div class='section'>", unsafe_allow_html=True)
+    st.markdown("### 📊 Mapping Analysis")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("✅ Auto-Mapped", st.session_state.mapped_count)
+    with col2:
+        st.metric("❓ Unmapped", len(st.session_state.unmapped_attributes))
+    with col3:
+        total = st.session_state.mapped_count + len(st.session_state.unmapped_attributes)
+        st.metric("📋 Total Attributes", total)
     st.markdown("</div>", unsafe_allow_html=True)
+
+    # Interactive mapping UI for unmapped attributes
+    if st.session_state.unmapped_attributes:
+        st.markdown("<div class='section'>", unsafe_allow_html=True)
+        st.markdown("### 🔗 Map Remaining Attributes")
+        st.caption("These predefined attributes couldn't be auto-mapped. Select the corresponding onboarding column for each.")
+        
+        on_headers = st.session_state.onboarding_data['headers']
+        options = ["(Leave Empty)"] + on_headers
+        
+        for attr in st.session_state.unmapped_attributes:
+            col_num = attr['col_num']
+            master_name = attr['master_name']
+            suggestions = attr['suggestions']
+            
+            # Auto-select best match (highest score suggestion)
+            if suggestions and len(suggestions) > 0:
+                best_match = suggestions[0][1]  # Get the column name with highest score
+                default_idx = options.index(best_match) if best_match in options else 0
+            else:
+                default_idx = 0
+            
+            selected = st.selectbox(
+                f"**{master_name}**",
+                options,
+                index=default_idx,
+                key=f"map_{col_num}"
+            )
+            
+            if selected != "(Leave Empty)":
+                st.session_state.user_mappings[col_num] = selected
+            elif col_num in st.session_state.user_mappings:
+                del st.session_state.user_mappings[col_num]
+        
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # Generate button
+    st.divider()
+    st.markdown("#### 📝 Final file name")
+    final_name_input = st.text_input(
+        "Type the name for the final masterfile (without extension)",
+        value="final_masterfile",
+        help="We'll add .xlsx or .xlsm automatically based on your template."
+    )
+    
+    if st.button("🚀 Generate Final Masterfile", type="primary"):
+        with st.spinner("🚀 Generating masterfile..."):
+            # Rebuild mappings with user selections
+            on_df = st.session_state.onboarding_data['df']
+            series_by_alias = st.session_state.onboarding_data['series_by_alias']
+            master_data = st.session_state.master_data
+            used_cols = master_data['used_cols']
+            display_headers = master_data['display_headers']
+            secondary_headers = master_data['secondary_headers']
+            master_bytes = master_data['bytes']
+            ext = master_data['ext']
+            
+            BULLET_DISP_N = norm("Key Product Features")
+            master_to_source = {}
+            
+            for c, (disp, sec) in enumerate(zip(display_headers, secondary_headers), start=1):
+                disp_norm = norm(disp)
+                sec_norm = norm(sec)
+                if disp_norm == BULLET_DISP_N and sec_norm:
+                    effective_header = sec
+                else:
+                    effective_header = disp
+                eff_norm = norm(effective_header)
+                if not eff_norm:
+                    continue
+                
+                # Check user mappings first
+                if c in st.session_state.user_mappings:
+                    user_col = st.session_state.user_mappings[c]
+                    if user_col in on_df.columns:
+                        master_to_source[c] = on_df[user_col]
+                        continue
+                
+                # Then check predefined mappings
+                aliases = mapping_aliases.get(eff_norm, [effective_header])
+                resolved = None
+                for a in aliases:
+                    s = series_by_alias.get(norm(a))
+                    if s is not None:
+                        resolved = s
+                        break
+                
+                if resolved is not None:
+                    master_to_source[c] = resolved
+                elif disp_norm == norm("Listing Action (List or Unlist)"):
+                    master_to_source[c] = SENTINEL_LIST
+            
+            n_rows = len(on_df)
+            
+            # Build data block
+            block = [[""] * used_cols for _ in range(n_rows)]
+            for col, src in master_to_source.items():
+                if src is SENTINEL_LIST:
+                    for i in range(n_rows):
+                        block[i][col-1] = "List"
+                else:
+                    vals = src.astype(str).tolist()
+                    m = min(len(vals), n_rows)
+                    for i in range(m):
+                        v = sanitize_xml_text(vals[i].strip())
+                        if v and v.lower() not in ("nan", "none", ""):
+                            block[i][col-1] = v
+            
+            # Fast XML write
+            out_bytes = fast_patch_template(
+                master_bytes=master_bytes,
+                sheet_name=MASTER_TEMPLATE_SHEET,
+                header_row=MASTER_DISPLAY_ROW,
+                start_row=MASTER_DATA_START_ROW,
+                used_cols=used_cols,
+                block_2d=block
+            )
+            
+            # Prepare download
+            mime_map = {
+                ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                ".xlsm": "application/vnd.ms-excel.sheet.macroEnabled.12",
+            }
+            out_mime = mime_map.get(ext, mime_map[".xlsx"])
+            final_base = safe_filename(final_name_input, fallback="final_masterfile")
+            final_filename = f"{final_base}{ext}"
+            
+            st.success("✅ Masterfile generated successfully!")
+            st.download_button(
+                "⬇️ Download Final Masterfile",
+                data=out_bytes,
+                file_name=final_filename,
+                mime=out_mime,
+                key="dl_final"
+            )
 
 with st.expander("📘 How to use (step-by-step)", expanded=False):
     st.markdown(dedent(f"""
     **This tool**
-    - Writes only into `{MASTER_TEMPLATE_SHEET}` and preserves everything else (including macros).
-    - Uses a fast XML sheet swap (seconds) — no slow fallbacks.
+    - Comes with {len(PREDEFINED_MAPPING)} pre-configured attribute mappings for Amazon
+    - Ultra-fast XML writer (generates files in seconds)
+    - Preserves all sheets, styles, formulas, and macros (.xlsm support)
 
-    **Run**
-    1) Upload the Masterfile (.xlsx/.xlsm) and the Onboarding (.xlsx)
-    2) Paste/upload Mapping JSON
-    3) Choose your desired final file name
-    4) Click **Generate**
+    **Steps**
+    1) Upload the **Masterfile Template** (.xlsx/.xlsm) and **Onboarding** (.xlsx)
+    2) Click **Analyze Files** to see which attributes are auto-mapped
+    3) Map any remaining unmapped attributes using the dropdown selectors
+    4) Choose your desired final file name
+    5) Click **Generate Final Masterfile**
+    6) Download your completed masterfile!
     """))
